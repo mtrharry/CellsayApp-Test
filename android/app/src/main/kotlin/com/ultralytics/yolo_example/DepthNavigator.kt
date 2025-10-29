@@ -1,7 +1,6 @@
 package com.ultralytics.yolo_example
 
 import android.graphics.RectF
-import com.google.ar.core.Coordinates2d
 import com.google.ar.core.Frame
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException
@@ -75,8 +74,6 @@ fun distanceMetersForBox(
     if (rect.isEmpty) return null
 
     val samplingStride = if (stride <= 0) 1 else stride
-    val viewPoint = FloatArray(2)
-    val depthPoint = FloatArray(2)
     val samples = mutableListOf<Float>()
 
     val depthWidth = depthPlane.width
@@ -87,26 +84,16 @@ fun distanceMetersForBox(
     while (y <= rect.bottom) {
         var x = rect.left
         while (x <= rect.right) {
-            viewPoint[0] = x
-            viewPoint[1] = y
-            try {
-                frame.transformCoordinates2d(
-                    Coordinates2d.VIEW,
-                    Coordinates2d.DEPTH,
-                    viewPoint,
-                    depthPoint,
-                )
-                val depthX = depthPoint[0].roundToInt()
-                val depthY = depthPoint[1].roundToInt()
-                if (depthX in 0 until depthWidth && depthY in 0 until depthHeight) {
-                    val index = depthY * depthWidth + depthX
-                    val depthMillimeters = data[index].toInt() and 0xFFFF
-                    if (depthMillimeters > 0) {
-                        samples.add(depthMillimeters / 1000f)
-                    }
+            val normalizedX = x / viewW.toFloat()
+            val normalizedY = y / viewH.toFloat()
+            val depthX = (normalizedX * depthWidth).roundToInt()
+            val depthY = (normalizedY * depthHeight).roundToInt()
+            if (depthX in 0 until depthWidth && depthY in 0 until depthHeight) {
+                val index = depthY * depthWidth + depthX
+                val depthMillimeters = data[index].toInt() and 0xFFFF
+                if (depthMillimeters > 0) {
+                    samples.add(depthMillimeters / 1000f)
                 }
-            } catch (_: Exception) {
-                // Ignore invalid samples.
             }
             x += samplingStride.toFloat()
         }
