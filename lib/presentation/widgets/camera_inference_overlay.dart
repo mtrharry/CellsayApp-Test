@@ -1,9 +1,7 @@
-
 import 'package:flutter/material.dart';
 import '../../models/models.dart';
 import '../controllers/camera_inference_controller.dart';
 import 'detection_stats_display.dart';
-import 'depth_control_section.dart';
 import 'model_selector.dart';
 import 'threshold_pill.dart';
 
@@ -20,45 +18,30 @@ class CameraInferenceOverlay extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final children = <Widget>[
+      ModelSelector(
+        selectedModel: controller.selectedModel,
+        isModelLoading: controller.isModelLoading,
+        onModelChanged: controller.changeModel,
+        textScaleFactor: controller.fontScale,
+      ),
+      SizedBox(height: isLandscape ? 8 : 12),
+      DetectionStatsDisplay(
+        detectionCount: controller.detectionCount,
+        currentFps: controller.currentFps,
+        textScaleFactor: controller.fontScale,
+      ),
+      const SizedBox(height: 8),
+      _buildThresholdPills(),
+    ];
+
     return Positioned(
       top: MediaQuery.of(context).padding.top + (isLandscape ? 8 : 16),
       left: isLandscape ? 8 : 16,
       right: isLandscape ? 8 : 16,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.center,
-        children: [
-          DepthControlSection(
-            isEnabled: controller.isDepthProcessingEnabled,
-            isAvailable: controller.isDepthServiceAvailable,
-            onChanged: controller.setDepthProcessingEnabled,
-            textScaleFactor: controller.fontScale,
-          ),
-          SizedBox(height: isLandscape ? 8 : 12),
-          ModelSelector(
-            selectedModel: controller.selectedModel,
-            isModelLoading: controller.isModelLoading,
-            onModelChanged: controller.changeModel,
-            isDepthEnabled: controller.isDepthProcessingEnabled,
-            isDepthAvailable: controller.isDepthServiceAvailable,
-            onDepthChanged: controller.setDepthProcessingEnabled,
-            textScaleFactor: controller.fontScale,
-          ),
-          SizedBox(height: isLandscape ? 8 : 12),
-          DetectionStatsDisplay(
-            detectionCount: controller.detectionCount,
-            currentFps: controller.currentFps,
-            textScaleFactor: controller.fontScale,
-          ),
-          const SizedBox(height: 8),
-          DepthControlSection(
-            isEnabled: controller.isDepthProcessingEnabled,
-            isAvailable: controller.isDepthServiceAvailable,
-            onChanged: controller.setDepthProcessingEnabled,
-            textScaleFactor: controller.fontScale,
-          ),
-          const SizedBox(height: 8),
-          _buildThresholdPills(),
-        ],
+        children: children,
       ),
     );
   }

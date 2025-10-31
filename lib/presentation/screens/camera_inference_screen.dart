@@ -18,7 +18,10 @@ import '../widgets/voice_settings_sheet.dart';
 /// - Performance metrics (FPS)
 class CameraInferenceScreen extends StatefulWidget {
   // CORRECCIÓN CLAVE: Cambiar 'initialModel' por 'modelType'
-  const CameraInferenceScreen({super.key, this.modelType = ModelType.Interior});
+  const CameraInferenceScreen({
+    super.key,
+    this.modelType = ModelType.Interior,
+  });
 
   final ModelType modelType;
 
