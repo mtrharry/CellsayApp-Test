@@ -74,7 +74,7 @@ class ModelSelector extends StatelessWidget {
             }).toList(),
           ),
         ),
-      ),
+      ],
     );
   }
 }
