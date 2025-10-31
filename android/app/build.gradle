@@ -56,10 +56,6 @@ android {
 flutter {
     source = "../.."
 }
-<<<<<<< HEAD
-
 dependencies {
     implementation "com.google.ar:core:1.45.0"
 }
-=======
->>>>>>> 9d889bb (mensaje)
