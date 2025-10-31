@@ -36,7 +36,7 @@ class DepthControlSection extends StatelessWidget {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  'PROFUNDIDAD',
+                  'PROFUNDIDAD EN OBJETOS',
                   style: theme.textTheme.bodyMedium?.copyWith(
                     color: Colors.white,
                     fontWeight: FontWeight.w700,
