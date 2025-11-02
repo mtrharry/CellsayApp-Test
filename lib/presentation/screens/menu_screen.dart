@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
@@ -47,6 +49,23 @@ class _MenuScreenState extends State<MenuScreen> {
     );
   }
 
+  void _listenForCommand() {
+    if (!_isListening) return;
+    unawaited(
+      _stt.listen(
+        localeId: 'es_MX',
+        listenFor: const Duration(seconds: 12),
+        pauseFor: const Duration(seconds: 4),
+        partialResults: false,
+        cancelOnError: true,
+        onResult: (r) {
+          if (!r.finalResult) return;
+          _handleVoice(r.recognizedWords);
+        },
+      ),
+    );
+  }
+
   Future<void> _startTalkback() async {
     if (_isListening) {
       await _stt.stop();
@@ -62,21 +81,12 @@ class _MenuScreenState extends State<MenuScreen> {
       return;
     }
     setState(() => _isListening = true);
-    await _stt.listen(
-      localeId: 'es_MX',
-      listenFor: const Duration(seconds: 6),
-      pauseFor: const Duration(seconds: 2),
-      cancelOnError: true,
-      onResult: (r) {
-        if (!r.finalResult) return;
-        _handleVoice(r.recognizedWords);
-      },
-    );
+    _listenForCommand();
   }
 
   void _handleVoice(String words) async {
     final t = words.toLowerCase();
-    if (t.contains('dinero') && t.contains('voz')) {
+    if (t.contains('dinero')) {
       await _stt.stop();
       setState(() => _isListening = false);
       if (!mounted) return;
@@ -116,6 +126,12 @@ class _MenuScreenState extends State<MenuScreen> {
       await _sayWeather();
       return;
     }
+
+    await _stt.stop();
+    if (!_isListening) return;
+    await _speak('No pude entender la opción. Por favor, dilo de nuevo.');
+    if (!_isListening) return;
+    _listenForCommand();
   }
 
   @override
