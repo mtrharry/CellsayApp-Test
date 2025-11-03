@@ -1,1 +1,7 @@
-{ "focalPx": 864.0 }
+{
+  "focalPx": 864.0,
+  "realHeightsMeters": {
+    "sign": 0.45,
+    "cartel": 0.45
+  }
+}

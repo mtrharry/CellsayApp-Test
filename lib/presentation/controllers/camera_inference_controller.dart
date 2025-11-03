@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui; // Import para ui.Size
 
@@ -10,6 +12,7 @@ import 'package:flutter/material.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart'
     hide ModelManager;
 import 'package:intl/intl.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:ultralytics_yolo/models/yolo_result.dart';
 import 'package:ultralytics_yolo/utils/error_handler.dart';
 import 'package:ultralytics_yolo/widgets/yolo_controller.dart';
@@ -37,8 +40,6 @@ class CameraInferenceController extends ChangeNotifier {
   final TextRecognizer _textRecognizer = TextRecognizer();
   bool _isOcrBusy = false;
   DateTime _lastOcrTimestamp = DateTime.now();
-  String? _lastOcrAnnouncement;
-  DateTime? _lastOcrAnnouncementTime;
   final List<String> _cartelClasses = const [
     'anuncios informativos',
     'anuncios publicitarios',
@@ -47,6 +48,15 @@ class CameraInferenceController extends ChangeNotifier {
     'letrero tienda',
     'publicidad de comida',
   ];
+  static const Duration _cartelPromptCooldown = Duration(seconds: 8);
+  static const int _maxCartelConfirmationAttempts = 2;
+  List<_CartelReading> _pendingCartelReadings = const [];
+  bool _awaitingCartelResponse = false;
+  bool _isListeningForSignage = false;
+  DateTime? _lastCartelPromptTime;
+  int _cartelConfirmationAttempts = 0;
+  final bool _signageMode;
+  bool _signageCaptureFrozen = false;
   // --- (FIN Nuevas variables para OCR) ---
 
   // --- VARIABLES ORIGINALES ---
@@ -87,6 +97,7 @@ class CameraInferenceController extends ChangeNotifier {
   DistanceEstimatorProvider();
   DistanceEstimator? _distanceEstimator;
   bool _loggedMissingDistanceEstimator = false;
+  final Set<String> _missingDistanceClassesLogged = <String>{};
   DepthInferenceService? _depthService;
   DepthFrame? _latestDepthFrame;
   bool _isDepthProcessingEnabled = false;
@@ -135,10 +146,16 @@ class CameraInferenceController extends ChangeNotifier {
   bool get isDepthServiceAvailable => _depthService != null;
   // --- FIN DE GETTERS ORIGINALES ---
 
-  CameraInferenceController({ModelType initialModel = ModelType.Interior})
-      : _selectedModel = initialModel,
-        _confidenceThreshold = _defaultConfidence(initialModel),
-        _numItemsThreshold = _defaultNumItems(initialModel) {
+  CameraInferenceController({
+    ModelType initialModel = ModelType.Interior,
+    bool signageMode = false,
+  })  : _signageMode = signageMode,
+        _selectedModel =
+            signageMode ? ModelType.LectorCarteles : initialModel,
+        _confidenceThreshold = _defaultConfidence(
+            signageMode ? ModelType.LectorCarteles : initialModel),
+        _numItemsThreshold = _defaultNumItems(
+            signageMode ? ModelType.LectorCarteles : initialModel) {
     _modelManager = ModelManager(
       onDownloadProgress: (progress) {
         _downloadProgress = progress;
@@ -195,6 +212,10 @@ class CameraInferenceController extends ChangeNotifier {
   /// Handle detection results and calculate FPS
   void onDetectionResults(List<YOLOResult> results, Uint8List? originalImage) {
     if (_isDisposed) return;
+
+    if (_signageMode && _signageCaptureFrozen) {
+      return;
+    }
 
     _annotateDistances(results);
     _frameCount++;
@@ -365,63 +386,74 @@ class CameraInferenceController extends ChangeNotifier {
   // --- INICIO DE MODIFICACIÓN (Función de OCR corregida) ---
   /// Ejecuta el OCR sobre la imagen y anuncia los resultados
   Future<void> _runOcrOnDetections(
-      Uint8List imageBytes, // Esto es un JPEG comprimido
-      ProcessedDetections processed,
-      DateTime detectionTime,
-      ) async {
+    Uint8List imageBytes,
+    ProcessedDetections processed,
+    DateTime detectionTime,
+  ) async {
     if (_isDisposed) return;
 
     final cartelDetections = processed.filteredResults
         .where((d) => _cartelClasses.contains(extractLabel(d).toLowerCase()))
         .toList();
 
-    if (cartelDetections.isEmpty) return;
-
-    // --- (Decodificar JPEG) ---
-
-    // 1. Decodificar la imagen JPEG en memoria
-    // Usamos compute para hacerlo en un Isolate separado y no bloquear la UI
-    final img.Image? decodedImage = await compute(img.decodeImage, imageBytes);
-
-    if (decodedImage == null) {
-      debugPrint("OCR Error: No se pudo decodificar la imagen JPEG.");
+    if (cartelDetections.isEmpty) {
       return;
     }
-    if (_isDisposed) return; // Comprobar de nuevo después del 'await'
 
-    // 2. Obtener los bytes crudos en formato RGBA
-    // --- INICIO DE CORRECCIÓN (toUint8List) ---
-    // Esta es la forma correcta de obtener los bytes RGBA crudos en image: 4.x
-    final Uint8List rawRgbaBytes = decodedImage.toUint8List();
-    final Uint8List rawBgraBytes = _ensureBgraOrder(rawRgbaBytes);
-    // --- FIN DE CORRECCIÓN (toUint8List) ---
+    _freezeSignageCapture();
+
+    img.Image? decodedImage;
+    try {
+      decodedImage = await compute(img.decodeImage, imageBytes);
+    } catch (error) {
+      await _handleCartelOcrFailure(
+        'No se pudo decodificar la imagen JPEG: $error',
+      );
+      return;
+    }
+
+    if (_isDisposed) {
+      return;
+    }
+
+    if (decodedImage == null) {
+      await _handleCartelOcrFailure(
+        'No se pudo decodificar la imagen JPEG.',
+      );
+      return;
+    }
+
     final int imageWidth = decodedImage.width;
     final int imageHeight = decodedImage.height;
 
-    // 3. Crear la metadata para la imagen cruda (RAW)
-    final metadata = InputImageMetadata(
-      size: ui.Size(imageWidth.toDouble(), imageHeight.toDouble()),
-      rotation: InputImageRotation.rotation0deg, // La imagen decodificada ya está derecha
-      format: InputImageFormat.bgra8888, // Especificamos el formato que ML Kit espera
-      bytesPerRow: imageWidth * 4, // 4 bytes por píxel (BGRA)
-    );
+    RecognizedText recognizedText;
+    File? tempImageFile;
+    try {
+      final tempDir = await getTemporaryDirectory();
+      final filePath =
+          '${tempDir.path}/ocr_frame_${DateTime.now().microsecondsSinceEpoch}.jpg';
+      tempImageFile = File(filePath);
+      await tempImageFile.writeAsBytes(imageBytes, flush: true);
 
-    // 4. Crear el InputImage desde los bytes crudos (rawRgbaBytes)
-    final inputImage = InputImage.fromBytes(
-      bytes: rawBgraBytes,
-      metadata: metadata,
-    );
+      final inputImage = InputImage.fromFilePath(tempImageFile.path);
+      recognizedText = await _textRecognizer.processImage(inputImage);
+    } catch (error) {
+      await _handleCartelOcrFailure('Error procesando OCR (archivo temporal): $error');
+      return;
+    } finally {
+      final fileToDelete = tempImageFile;
+      if (fileToDelete != null) {
+        unawaited(Future(() async {
+          try {
+            await fileToDelete.delete();
+          } catch (_) {}
+        }));
+      }
+    }
 
-    // --- (Fin Decodificar JPEG) ---
-
-    // 5. Procesar la imagen completa para OCR
-    final RecognizedText recognizedText =
-    await _textRecognizer.processImage(inputImage);
-
-    if (_isDisposed) return;
-
-    // 6. Mapear texto a carteles
-    String ocrAnnouncement = "";
+    if (_isDisposed) {
+      return;
+    }
 
     final normalizedDetections = <_OcrCartelTarget>[];
     for (final cartel in cartelDetections) {
@@ -432,23 +464,29 @@ class CameraInferenceController extends ChangeNotifier {
           _normalizeDetectionRect(cartelRect, imageWidth, imageHeight);
       if (normalizedRect == null) continue;
 
-      normalizedDetections.add(_OcrCartelTarget(
-        detection: cartel,
-        normalizedRect: normalizedRect,
-      ));
+      normalizedDetections.add(
+        _OcrCartelTarget(
+          detection: cartel,
+          normalizedRect: normalizedRect,
+        ),
+      );
     }
 
     if (normalizedDetections.isEmpty) {
+      await _handleCartelOcrFailure(
+        'No se pudo localizar la región del letrero en la imagen.',
+      );
       return;
     }
 
-    for (final target in normalizedDetections) {
-      final Rect cartelRect = target.normalizedRect;
-      final Rect expandedCartelRect = _expandNormalizedRect(cartelRect, 0.02);
+    final List<_CartelReading> newReadings = [];
 
-      String textoDelCartel = "";
+    for (final target in normalizedDetections) {
+      final Rect expandedCartelRect =
+          _expandNormalizedRect(target.normalizedRect, 0.02);
+
+      String textoDelCartel = '';
       for (final block in recognizedText.blocks) {
-        // Convertir BoundingBox de MLKit (pixeles) a Rect normalizado
         final blockRect = Rect.fromLTWH(
           block.boundingBox.left / imageWidth,
           block.boundingBox.top / imageHeight,
@@ -456,40 +494,34 @@ class CameraInferenceController extends ChangeNotifier {
           block.boundingBox.height / imageHeight,
         );
 
-        // 7. Comprobar si el texto está (parcialmente) dentro del cartel
         if (expandedCartelRect.overlaps(blockRect)) {
-          textoDelCartel += block.text.replaceAll('\n', ' ') + " ";
+          textoDelCartel += block.text.replaceAll('\n', ' ') + ' ';
         }
       }
 
-      if (textoDelCartel.trim().isNotEmpty) {
-        // 8. Combinar el anuncio (usando extractLabel)
-        final label = extractLabel(target.detection, fallback: "cartel");
-        ocrAnnouncement += "Detecté un $label. Dice: ${textoDelCartel.trim()}. ";
-      }
+      final label = extractLabel(target.detection, fallback: 'cartel');
+      final capturedImage = _captureCartelImage(
+        decodedImage,
+        expandedCartelRect,
+      );
+
+      newReadings.add(
+        _CartelReading(
+          label: label,
+          text: textoDelCartel.trim(),
+          imageBytes: capturedImage,
+        ),
+      );
     }
 
-    // 9. Anunciar el texto del OCR (si es nuevo)
-    if (ocrAnnouncement.isNotEmpty) {
-      final normalizedAnnouncement = ocrAnnouncement.trim();
-      final isDuplicate = normalizedAnnouncement == _lastOcrAnnouncement &&
-          _lastOcrAnnouncementTime != null &&
-          detectionTime
-                  .difference(_lastOcrAnnouncementTime!)
-                  .inMilliseconds <
-              4000;
-
-      if (!isDuplicate) {
-        _lastOcrAnnouncement = normalizedAnnouncement;
-        _lastOcrAnnouncementTime = detectionTime;
-
-        await _announceSystemMessage(
-          ocrAnnouncement,
-          force: true,
-          bypassCooldown: true,
-        );
-      }
+    if (newReadings.isEmpty) {
+      await _handleCartelOcrFailure(
+        'No se encontró texto legible dentro de los letreros detectados.',
+      );
+      return;
     }
+
+    await _handleCartelReadings(newReadings, detectionTime);
   }
   // --- FIN DE MODIFICACIÓN ---
 
@@ -551,22 +583,307 @@ class CameraInferenceController extends ChangeNotifier {
     return Rect.fromLTRB(left, top, right, bottom);
   }
 
-  Uint8List _ensureBgraOrder(Uint8List rgbaBytes) {
-    if (rgbaBytes.length < 4) {
-      return rgbaBytes;
+  Uint8List? _captureCartelImage(img.Image source, Rect normalizedRect) {
+    if (source.width <= 0 || source.height <= 0) {
+      return null;
     }
 
-    // Los bytes producidos por el paquete `image` están en RGBA. ML Kit
-    // espera BGRA cuando usamos `InputImageFormat.bgra8888`, por lo que
-    // reordenamos los canales cuando sea necesario.
-    final Uint8List bgraBytes = Uint8List(rgbaBytes.length);
-    for (int i = 0; i < rgbaBytes.length; i += 4) {
-      bgraBytes[i] = rgbaBytes[i + 2];
-      bgraBytes[i + 1] = rgbaBytes[i + 1];
-      bgraBytes[i + 2] = rgbaBytes[i];
-      bgraBytes[i + 3] = rgbaBytes[i + 3];
+    final double leftPx = normalizedRect.left.clamp(0.0, 1.0) * source.width;
+    final double topPx = normalizedRect.top.clamp(0.0, 1.0) * source.height;
+    final double rightPx = normalizedRect.right.clamp(0.0, 1.0) * source.width;
+    final double bottomPx = normalizedRect.bottom.clamp(0.0, 1.0) * source.height;
+
+    final int x0 = math.max(0, math.min(source.width - 1, leftPx.floor()));
+    final int y0 = math.max(0, math.min(source.height - 1, topPx.floor()));
+    final int x1 = math.max(x0 + 1, math.min(source.width, rightPx.ceil()));
+    final int y1 = math.max(y0 + 1, math.min(source.height, bottomPx.ceil()));
+
+    final int width = math.max(1, math.min(source.width - x0, x1 - x0));
+    final int height = math.max(1, math.min(source.height - y0, y1 - y0));
+
+    try {
+      final img.Image cropped = img.copyCrop(
+        source,
+        x: x0,
+        y: y0,
+        width: width,
+        height: height,
+      );
+      return Uint8List.fromList(img.encodeJpg(cropped));
+    } catch (_) {
+      return null;
     }
-    return bgraBytes;
+  }
+
+  Future<void> _handleCartelReadings(
+    List<_CartelReading> readings,
+    DateTime detectionTime,
+  ) async {
+    if (_isDisposed || readings.isEmpty) {
+      _resumeSignageCapture();
+      return;
+    }
+
+    final bool changed = _cartelReadingsDiffer(_pendingCartelReadings, readings);
+    _pendingCartelReadings = readings;
+
+    if (!changed) {
+      if (_awaitingCartelResponse || _isListeningForSignage) {
+        return;
+      }
+
+      final lastPrompt = _lastCartelPromptTime;
+      if (lastPrompt != null &&
+          detectionTime.difference(lastPrompt) < _cartelPromptCooldown) {
+        _resumeSignageCapture();
+        return;
+      }
+
+      _resumeSignageCapture();
+      return;
+    }
+
+    final lastPrompt = _lastCartelPromptTime;
+    if (lastPrompt != null &&
+        detectionTime.difference(lastPrompt) < _cartelPromptCooldown) {
+      _resumeSignageCapture();
+      return;
+    }
+
+    _lastCartelPromptTime = detectionTime;
+    _cartelConfirmationAttempts = 0;
+    _awaitingCartelResponse = true;
+    _setVoiceFeedbackPaused(true);
+
+    final int count = readings.length;
+    final String prompt = count == 1
+        ? 'Detecté un letrero. ¿Quieres que lo lea?'
+        : 'Detecté $count letreros. ¿Quieres que los lea?';
+
+    await _announceSystemMessage(
+      prompt,
+      force: true,
+      bypassCooldown: true,
+    );
+
+    if (_isDisposed) {
+      return;
+    }
+
+    await _listenForCartelConfirmation();
+  }
+
+  Future<void> _handleCartelOcrFailure(String reason) async {
+    debugPrint('Cartel OCR failure: $reason');
+    if (_isDisposed) {
+      return;
+    }
+
+    if (_signageMode) {
+      await _announceSystemMessage(
+        'Ha ocurrido un fallo al procesar los letreros.',
+        force: true,
+        bypassCooldown: true,
+      );
+      _resumeSignageCapture();
+    }
+  }
+
+  bool _cartelReadingsDiffer(
+    List<_CartelReading> previous,
+    List<_CartelReading> current,
+  ) {
+    if (previous.length != current.length) {
+      return true;
+    }
+    for (var i = 0; i < current.length; i++) {
+      if (!previous[i].isSameContent(current[i])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  Future<void> _listenForCartelConfirmation({bool retry = false}) async {
+    if (_isDisposed || !_awaitingCartelResponse) {
+      return;
+    }
+
+    if (_voiceCommandService.isListening) {
+      await _voiceCommandService.cancelListening();
+    }
+
+    _isListeningForSignage = true;
+    _voiceCommandStatus = retry
+        ? 'No entendí, por favor responde sí o no.'
+        : 'Escuchando respuesta sobre los letreros...';
+    notifyListeners();
+
+    final started = await _voiceCommandService.startListening(
+      onResult: (text) {
+        if (_isDisposed) return;
+        unawaited(_processCartelConfirmation(text));
+      },
+      onError: (message) {
+        if (_isDisposed) return;
+        unawaited(_handleCartelConfirmationError(message));
+      },
+      onStatus: (listening) {
+        if (_isDisposed) return;
+        _isListeningForSignage = listening;
+        if (!listening && _awaitingCartelResponse) {
+          notifyListeners();
+        }
+      },
+      listenFor: const Duration(seconds: 5),
+      pauseFor: const Duration(seconds: 2),
+    );
+
+    if (!started && !_isDisposed) {
+      await _handleCartelConfirmationError(
+        'No pude iniciar la escucha de la respuesta.',
+      );
+    }
+  }
+
+  Future<void> _processCartelConfirmation(String text) async {
+    if (_isDisposed || !_awaitingCartelResponse) {
+      return;
+    }
+
+    await _voiceCommandService.stopListening();
+
+    final normalized = _normalizeVoiceCommand(text);
+    bool? wantsReading;
+
+    if (_commandContainsAny(normalized, [
+      'si',
+      'claro',
+      'lee',
+      'leer',
+      'por favor',
+      'adelante',
+    ])) {
+      wantsReading = true;
+    } else if (_commandContainsAny(normalized, [
+      'no',
+      'luego',
+      'despues',
+      'negativo',
+    ])) {
+      wantsReading = false;
+    }
+
+    if (wantsReading == null) {
+      _cartelConfirmationAttempts++;
+      if (_cartelConfirmationAttempts <= _maxCartelConfirmationAttempts) {
+        await _announceSystemMessage(
+          'No entendí la respuesta. Por favor responde sí o no.',
+          force: true,
+          bypassCooldown: true,
+        );
+        if (_isDisposed) return;
+        await _listenForCartelConfirmation(retry: true);
+        return;
+      }
+
+      await _announceSystemMessage(
+        'No pude confirmar si deseas la lectura de los letreros.',
+        force: true,
+        bypassCooldown: true,
+      );
+      await _finishCartelPrompt();
+      return;
+    }
+
+    if (wantsReading) {
+      await _announceSystemMessage(
+        'Muy bien, leyendo los letreros.',
+        force: true,
+        bypassCooldown: true,
+      );
+      if (_isDisposed) return;
+      await _readPendingCartelTexts();
+      await _finishCartelPrompt(clearPending: true);
+    } else {
+      await _announceSystemMessage(
+        'De acuerdo, no leeré los letreros ahora.',
+        force: true,
+        bypassCooldown: true,
+      );
+      await _finishCartelPrompt();
+    }
+  }
+
+  Future<void> _handleCartelConfirmationError(String message) async {
+    if (_isDisposed) {
+      return;
+    }
+
+    _voiceCommandStatus = message;
+    notifyListeners();
+
+    await _announceSystemMessage(
+      message,
+      force: true,
+      bypassCooldown: true,
+    );
+
+    await _finishCartelPrompt();
+  }
+
+  Future<void> _finishCartelPrompt({bool clearPending = false}) async {
+    if (_voiceCommandService.isListening) {
+      await _voiceCommandService.cancelListening();
+    }
+
+    if (_isDisposed) {
+      return;
+    }
+
+    _awaitingCartelResponse = false;
+    _isListeningForSignage = false;
+    _cartelConfirmationAttempts = 0;
+    if (clearPending) {
+      _pendingCartelReadings = const [];
+    }
+    _voiceCommandStatus = null;
+    _setVoiceFeedbackPaused(false);
+    _resumeSignageCapture();
+    notifyListeners();
+  }
+
+  Future<void> _readPendingCartelTexts() async {
+    if (_pendingCartelReadings.isEmpty) {
+      await _announceSystemMessage(
+        'No tengo texto legible en los letreros.',
+        force: true,
+        bypassCooldown: true,
+      );
+      return;
+    }
+
+    final total = _pendingCartelReadings.length;
+    for (var i = 0; i < total; i++) {
+      final reading = _pendingCartelReadings[i];
+      final prefix = total > 1 ? 'Letrero ${i + 1}' : 'El letrero';
+      final description = reading.label.isNotEmpty
+          ? '$prefix (${reading.label.toLowerCase()})'
+          : prefix;
+      final message = reading.hasText
+          ? '$description dice: ${reading.text}.'
+          : '$description no tiene texto legible.';
+
+      await _announceSystemMessage(
+        message,
+        force: true,
+        bypassCooldown: true,
+      );
+
+      if (_isDisposed) {
+        return;
+      }
+    }
   }
 
   void _annotateDistances(List<YOLOResult> results) {
@@ -611,11 +928,36 @@ class CameraInferenceController extends ChangeNotifier {
     }
   }
 
+  void _freezeSignageCapture() {
+    if (!_signageMode) {
+      return;
+    }
+    _signageCaptureFrozen = true;
+  }
+
+  void _resumeSignageCapture() {
+    if (!_signageMode) {
+      return;
+    }
+    _signageCaptureFrozen = false;
+  }
+
   double? _combineDistanceEstimates(double? depth, double? geometric) {
     if (depth != null && geometric != null) {
       return (depth * 0.7) + (geometric * 0.3);
     }
     return depth ?? geometric;
+  }
+
+  String _normalizeClassForDistance(String label) {
+    final lower = label.toLowerCase();
+    if (lower.contains('letrero') ||
+        lower.contains('cartel') ||
+        lower.contains('anuncio') ||
+        lower.contains('publicidad')) {
+      return 'sign';
+    }
+    return lower;
   }
 
   double? _estimateGeometricDistance(
@@ -663,19 +1005,30 @@ class CameraInferenceController extends ChangeNotifier {
       return null;
     }
 
+    final distanceClass = _normalizeClassForDistance(label);
     final distance = estimator.distanceMeters(
-      detectedClass: label,
+      detectedClass: distanceClass,
       bboxHeightRelative: bboxHeightRelative,
       imageHeightPx: imageHeight,
     );
 
     if (distance == null) {
-      debugPrint(
-        'DistanceEstimator: no se puede estimar distancia para $label (bboxHeightPx=${bboxHeightPx.toStringAsFixed(2)}).',
-      );
+      final hasCalibration =
+          estimator.realHeightsMeters.containsKey(distanceClass);
+      if (!hasCalibration) {
+        if (_missingDistanceClassesLogged.add(distanceClass)) {
+          debugPrint(
+            'DistanceEstimator: sin calibración para $distanceClass (label original: $label).',
+          );
+        }
+      } else {
+        debugPrint(
+          'DistanceEstimator: no se puede estimar distancia para $label (bboxHeightPx=${bboxHeightPx.toStringAsFixed(2)}).',
+        );
+      }
     } else {
       debugPrint(
-        'DistanceEstimator: clase=$label bboxHeightPx=${bboxHeightPx.toStringAsFixed(2)} distanceM=${distance.toStringAsFixed(2)}.',
+        'DistanceEstimator: clase=$distanceClass bboxHeightPx=${bboxHeightPx.toStringAsFixed(2)} distanceM=${distance.toStringAsFixed(2)} (label original: $label).',
       );
     }
 
@@ -810,6 +1163,13 @@ class CameraInferenceController extends ChangeNotifier {
   void onVoiceCommandRequested() {
     if (_isDisposed || _areControlsLocked) return;
 
+    if (_awaitingCartelResponse || _isListeningForSignage) {
+      _voiceCommandStatus =
+          'Primero responde si deseas que lea los letreros.';
+      notifyListeners();
+      return;
+    }
+
     if (_isListeningForCommand) {
       unawaited(_cancelVoiceCommand());
     } else {
@@ -819,6 +1179,13 @@ class CameraInferenceController extends ChangeNotifier {
 
   void onVoiceCommandHoldStart() {
     if (_isDisposed || _areControlsLocked) return;
+
+    if (_awaitingCartelResponse || _isListeningForSignage) {
+      _voiceCommandStatus =
+          'Necesito tu respuesta sobre los letreros antes de otros comandos.';
+      notifyListeners();
+      return;
+    }
 
     if (_voiceCommandService.isListening || _isListeningForCommand) {
       return;
@@ -1086,6 +1453,13 @@ class CameraInferenceController extends ChangeNotifier {
 
   Future<void> _startVoiceCommand() async {
     if (_isDisposed) return;
+
+    if (_awaitingCartelResponse || _isListeningForSignage) {
+      _voiceCommandStatus =
+          'Responde primero si deseas que lea los letreros.';
+      notifyListeners();
+      return;
+    }
 
     _isListeningForCommand = true;
     _setVoiceFeedbackPaused(true);
@@ -1454,4 +1828,23 @@ class _OcrCartelTarget {
 
   final YOLOResult detection;
   final Rect normalizedRect;
+}
+
+class _CartelReading {
+  const _CartelReading({
+    required this.label,
+    required this.text,
+    this.imageBytes,
+  });
+
+  final String label;
+  final String text;
+  final Uint8List? imageBytes;
+
+  bool get hasText => text.trim().isNotEmpty;
+
+  bool isSameContent(_CartelReading other) {
+    return label.toLowerCase() == other.label.toLowerCase() &&
+        text.trim() == other.text.trim();
+  }
 }
