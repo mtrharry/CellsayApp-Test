@@ -23,11 +23,13 @@ class CameraInferenceScreen extends StatefulWidget {
     this.modelType = ModelType.Interior,
     this.showDepthControls = false,
     this.enableDepthProcessing = false,
+    this.signageMode = false,
   });
 
   final ModelType modelType;
   final bool showDepthControls;
   final bool enableDepthProcessing;
+  final bool signageMode;
 
   @override
   State<CameraInferenceScreen> createState() => _CameraInferenceScreenState();
@@ -40,7 +42,10 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> {
   void initState() {
     super.initState();
     // CORRECCIÓN: Usar widget.modelType
-    _controller = CameraInferenceController(initialModel: widget.modelType);
+    _controller = CameraInferenceController(
+      initialModel: widget.modelType,
+      signageMode: widget.signageMode,
+    );
     _controller.initialize().catchError((error) {
       if (mounted) {
         _showError('Model Loading Error', error.toString());

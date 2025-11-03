@@ -45,7 +45,7 @@ class _MenuScreenState extends State<MenuScreen> {
 
   Future<void> _readMenu() async {
     await _speak(
-      'Menú principal. Opciones: Dinero, Objetos, Profundidad, Lectura, Hora, Clima. Diga una opción.',
+      'Menú principal. Opciones: Dinero, Objetos, Profundidad, Lectura, Leer carteles, Hora, Clima. Diga una opción.',
     );
   }
 
@@ -107,7 +107,16 @@ class _MenuScreenState extends State<MenuScreen> {
       Navigator.pushNamed(context, '/depth');
       return;
     }
-    if (t.contains('lectura') || t.contains('texto') || t.contains('leer')) {
+    if (t.contains('cartel') || t.contains('letrero')) {
+      await _stt.stop();
+      setState(() => _isListening = false);
+      if (!mounted) return;
+      Navigator.pushNamed(context, '/sign-reader');
+      return;
+    }
+    if (t.contains('lectura') ||
+        t.contains('texto') ||
+        (t.contains('leer') && !t.contains('cartel') && !t.contains('letrero'))) {
       await _stt.stop();
       setState(() => _isListening = false);
       if (!mounted) return;
@@ -164,6 +173,11 @@ class _MenuScreenState extends State<MenuScreen> {
         label: 'Lectura',
         icon: Icons.menu_book_rounded,
         onTap: () => Navigator.pushNamed(context, '/text-reader'),
+      ),
+      _BigButton(
+        label: 'Leer carteles',
+        icon: Icons.signpost_rounded,
+        onTap: () => Navigator.pushNamed(context, '/sign-reader'),
       ),
       _BigButton(
         label: 'Hora',

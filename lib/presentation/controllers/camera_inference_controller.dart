@@ -53,6 +53,8 @@ class CameraInferenceController extends ChangeNotifier {
   bool _isListeningForSignage = false;
   DateTime? _lastCartelPromptTime;
   int _cartelConfirmationAttempts = 0;
+  final bool _signageMode;
+  bool _signageCaptureFrozen = false;
   // --- (FIN Nuevas variables para OCR) ---
 
   // --- VARIABLES ORIGINALES ---
@@ -141,10 +143,16 @@ class CameraInferenceController extends ChangeNotifier {
   bool get isDepthServiceAvailable => _depthService != null;
   // --- FIN DE GETTERS ORIGINALES ---
 
-  CameraInferenceController({ModelType initialModel = ModelType.Interior})
-      : _selectedModel = initialModel,
-        _confidenceThreshold = _defaultConfidence(initialModel),
-        _numItemsThreshold = _defaultNumItems(initialModel) {
+  CameraInferenceController({
+    ModelType initialModel = ModelType.Interior,
+    bool signageMode = false,
+  })  : _signageMode = signageMode,
+        _selectedModel =
+            signageMode ? ModelType.LectorCarteles : initialModel,
+        _confidenceThreshold = _defaultConfidence(
+            signageMode ? ModelType.LectorCarteles : initialModel),
+        _numItemsThreshold = _defaultNumItems(
+            signageMode ? ModelType.LectorCarteles : initialModel) {
     _modelManager = ModelManager(
       onDownloadProgress: (progress) {
         _downloadProgress = progress;
@@ -201,6 +209,10 @@ class CameraInferenceController extends ChangeNotifier {
   /// Handle detection results and calculate FPS
   void onDetectionResults(List<YOLOResult> results, Uint8List? originalImage) {
     if (_isDisposed) return;
+
+    if (_signageMode && _signageCaptureFrozen) {
+      return;
+    }
 
     _annotateDistances(results);
     _frameCount++;
@@ -371,62 +383,71 @@ class CameraInferenceController extends ChangeNotifier {
   // --- INICIO DE MODIFICACIÓN (Función de OCR corregida) ---
   /// Ejecuta el OCR sobre la imagen y anuncia los resultados
   Future<void> _runOcrOnDetections(
-      Uint8List imageBytes, // Esto es un JPEG comprimido
-      ProcessedDetections processed,
-      DateTime detectionTime,
-      ) async {
+    Uint8List imageBytes,
+    ProcessedDetections processed,
+    DateTime detectionTime,
+  ) async {
     if (_isDisposed) return;
 
     final cartelDetections = processed.filteredResults
         .where((d) => _cartelClasses.contains(extractLabel(d).toLowerCase()))
         .toList();
 
-    if (cartelDetections.isEmpty) return;
-
-    // --- (Decodificar JPEG) ---
-
-    // 1. Decodificar la imagen JPEG en memoria
-    // Usamos compute para hacerlo en un Isolate separado y no bloquear la UI
-    final img.Image? decodedImage = await compute(img.decodeImage, imageBytes);
-
-    if (decodedImage == null) {
-      debugPrint("OCR Error: No se pudo decodificar la imagen JPEG.");
+    if (cartelDetections.isEmpty) {
       return;
     }
-    if (_isDisposed) return; // Comprobar de nuevo después del 'await'
 
-    // 2. Obtener los bytes crudos en formato RGBA
-    // --- INICIO DE CORRECCIÓN (toUint8List) ---
-    // Esta es la forma correcta de obtener los bytes RGBA crudos en image: 4.x
+    _freezeSignageCapture();
+
+    img.Image? decodedImage;
+    try {
+      decodedImage = await compute(img.decodeImage, imageBytes);
+    } catch (error) {
+      await _handleCartelOcrFailure(
+        'No se pudo decodificar la imagen JPEG: $error',
+      );
+      return;
+    }
+
+    if (_isDisposed) {
+      return;
+    }
+
+    if (decodedImage == null) {
+      await _handleCartelOcrFailure(
+        'No se pudo decodificar la imagen JPEG.',
+      );
+      return;
+    }
+
     final Uint8List rawRgbaBytes = decodedImage.toUint8List();
     final Uint8List rawBgraBytes = _ensureBgraOrder(rawRgbaBytes);
-    // --- FIN DE CORRECCIÓN (toUint8List) ---
     final int imageWidth = decodedImage.width;
     final int imageHeight = decodedImage.height;
 
-    // 3. Crear la metadata para la imagen cruda (RAW)
     final metadata = InputImageMetadata(
       size: ui.Size(imageWidth.toDouble(), imageHeight.toDouble()),
-      rotation: InputImageRotation.rotation0deg, // La imagen decodificada ya está derecha
-      format: InputImageFormat.bgra8888, // Especificamos el formato que ML Kit espera
-      bytesPerRow: imageWidth * 4, // 4 bytes por píxel (BGRA)
+      rotation: InputImageRotation.rotation0deg,
+      format: InputImageFormat.bgra8888,
+      bytesPerRow: imageWidth * 4,
     );
 
-    // 4. Crear el InputImage desde los bytes crudos (rawRgbaBytes)
-    final inputImage = InputImage.fromBytes(
-      bytes: rawBgraBytes,
-      metadata: metadata,
-    );
+    RecognizedText recognizedText;
+    try {
+      final inputImage = InputImage.fromBytes(
+        bytes: rawBgraBytes,
+        metadata: metadata,
+      );
+      recognizedText = await _textRecognizer.processImage(inputImage);
+    } catch (error) {
+      await _handleCartelOcrFailure('Error procesando OCR: $error');
+      return;
+    }
 
-    // --- (Fin Decodificar JPEG) ---
+    if (_isDisposed) {
+      return;
+    }
 
-    // 5. Procesar la imagen completa para OCR
-    final RecognizedText recognizedText =
-    await _textRecognizer.processImage(inputImage);
-
-    if (_isDisposed) return;
-
-    // 6. Mapear texto a carteles
     final normalizedDetections = <_OcrCartelTarget>[];
     for (final cartel in cartelDetections) {
       final cartelRect = extractBoundingBox(cartel);
@@ -436,25 +457,29 @@ class CameraInferenceController extends ChangeNotifier {
           _normalizeDetectionRect(cartelRect, imageWidth, imageHeight);
       if (normalizedRect == null) continue;
 
-      normalizedDetections.add(_OcrCartelTarget(
-        detection: cartel,
-        normalizedRect: normalizedRect,
-      ));
+      normalizedDetections.add(
+        _OcrCartelTarget(
+          detection: cartel,
+          normalizedRect: normalizedRect,
+        ),
+      );
     }
 
     if (normalizedDetections.isEmpty) {
+      await _handleCartelOcrFailure(
+        'No se pudo localizar la región del letrero en la imagen.',
+      );
       return;
     }
 
     final List<_CartelReading> newReadings = [];
 
     for (final target in normalizedDetections) {
-      final Rect cartelRect = target.normalizedRect;
-      final Rect expandedCartelRect = _expandNormalizedRect(cartelRect, 0.02);
+      final Rect expandedCartelRect =
+          _expandNormalizedRect(target.normalizedRect, 0.02);
 
-      String textoDelCartel = "";
+      String textoDelCartel = '';
       for (final block in recognizedText.blocks) {
-        // Convertir BoundingBox de MLKit (pixeles) a Rect normalizado
         final blockRect = Rect.fromLTWH(
           block.boundingBox.left / imageWidth,
           block.boundingBox.top / imageHeight,
@@ -462,13 +487,12 @@ class CameraInferenceController extends ChangeNotifier {
           block.boundingBox.height / imageHeight,
         );
 
-        // 7. Comprobar si el texto está (parcialmente) dentro del cartel
         if (expandedCartelRect.overlaps(blockRect)) {
-          textoDelCartel += block.text.replaceAll('\n', ' ') + " ";
+          textoDelCartel += block.text.replaceAll('\n', ' ') + ' ';
         }
       }
 
-      final label = extractLabel(target.detection, fallback: "cartel");
+      final label = extractLabel(target.detection, fallback: 'cartel');
       final capturedImage = _captureCartelImage(
         decodedImage,
         expandedCartelRect,
@@ -481,6 +505,13 @@ class CameraInferenceController extends ChangeNotifier {
           imageBytes: capturedImage,
         ),
       );
+    }
+
+    if (newReadings.isEmpty) {
+      await _handleCartelOcrFailure(
+        'No se encontró texto legible dentro de los letreros detectados.',
+      );
+      return;
     }
 
     await _handleCartelReadings(newReadings, detectionTime);
@@ -582,30 +613,33 @@ class CameraInferenceController extends ChangeNotifier {
     DateTime detectionTime,
   ) async {
     if (_isDisposed || readings.isEmpty) {
+      _resumeSignageCapture();
       return;
     }
 
     final bool changed = _cartelReadingsDiffer(_pendingCartelReadings, readings);
     _pendingCartelReadings = readings;
 
-    if (!changed && (_awaitingCartelResponse || _isListeningForSignage)) {
+    if (!changed) {
+      if (_awaitingCartelResponse || _isListeningForSignage) {
+        return;
+      }
+
+      final lastPrompt = _lastCartelPromptTime;
+      if (lastPrompt != null &&
+          detectionTime.difference(lastPrompt) < _cartelPromptCooldown) {
+        _resumeSignageCapture();
+        return;
+      }
+
+      _resumeSignageCapture();
       return;
     }
 
     final lastPrompt = _lastCartelPromptTime;
-    if (!changed && lastPrompt != null) {
-      final elapsed = detectionTime.difference(lastPrompt);
-      if (elapsed < _cartelPromptCooldown) {
-        return;
-      }
-    }
-
-    if (!changed) {
-      return;
-    }
-
     if (lastPrompt != null &&
         detectionTime.difference(lastPrompt) < _cartelPromptCooldown) {
+      _resumeSignageCapture();
       return;
     }
 
@@ -630,6 +664,22 @@ class CameraInferenceController extends ChangeNotifier {
     }
 
     await _listenForCartelConfirmation();
+  }
+
+  Future<void> _handleCartelOcrFailure(String reason) async {
+    debugPrint('Cartel OCR failure: $reason');
+    if (_isDisposed) {
+      return;
+    }
+
+    if (_signageMode) {
+      await _announceSystemMessage(
+        'Ha ocurrido un fallo al procesar los letreros.',
+        force: true,
+        bypassCooldown: true,
+      );
+      _resumeSignageCapture();
+    }
   }
 
   bool _cartelReadingsDiffer(
@@ -792,6 +842,7 @@ class CameraInferenceController extends ChangeNotifier {
     }
     _voiceCommandStatus = null;
     _setVoiceFeedbackPaused(false);
+    _resumeSignageCapture();
     notifyListeners();
   }
 
@@ -886,6 +937,20 @@ class CameraInferenceController extends ChangeNotifier {
       result.distanceM =
           _combineDistanceEstimates(depthDistance, geometricDistance);
     }
+  }
+
+  void _freezeSignageCapture() {
+    if (!_signageMode) {
+      return;
+    }
+    _signageCaptureFrozen = true;
+  }
+
+  void _resumeSignageCapture() {
+    if (!_signageMode) {
+      return;
+    }
+    _signageCaptureFrozen = false;
   }
 
   double? _combineDistanceEstimates(double? depth, double? geometric) {
