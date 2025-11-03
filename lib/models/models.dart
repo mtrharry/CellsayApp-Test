@@ -1,8 +1,9 @@
 import 'package:ultralytics_yolo/models/yolo_task.dart';
 
 enum ModelType {
-  Interior('yolo11n', YOLOTask.detect, 'Detección General'), // Cambié Interior para que cargue yolo11n
-  Exterior('best_float16', YOLOTask.detect, 'Detección Exterior');
+  Interior('yolo11n', YOLOTask.detect, 'Detección General'),
+  Exterior('best_float16', YOLOTask.detect, 'Detección Exterior'),
+  LectorCarteles('carteles', YOLOTask.detect, 'Lector de Carteles'); // <-- AÑADE ESTA LÍNEA
 
   const ModelType(this.modelName, this.task, this.displayName);
 
@@ -19,6 +20,8 @@ ModelType modelTypeFromString(String? value, {ModelType fallback = ModelType.Int
       return ModelType.Interior;
     case 'exterior':
       return ModelType.Exterior;
+    case 'lectorcarteles': // <-- AÑADE ESTA LÍNEA
+      return ModelType.LectorCarteles; // <-- AÑADE ESTA LÍNEA
     case 'dinero':
     case 'money': // Compatibilidad con valores previos
       return ModelType.Interior;

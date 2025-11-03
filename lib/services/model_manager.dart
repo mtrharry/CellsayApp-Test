@@ -1,4 +1,3 @@
-
 import 'dart:io';
 import 'package:archive/archive.dart';
 import 'package:flutter/services.dart';
@@ -20,8 +19,16 @@ class ModelManager {
   static const String _modelDownloadBaseUrl =
       'https://github.com/ultralytics/yolo-flutter-app/releases/download/v0.0.0';
 
+  // --- INICIO DE LA MODIFICACIÓN ---
+  /// Lista de modelos locales que NO deben ser descargados.
+  static const List<String> _localCustomModels = [
+    'best_float16',
+    'carteles', // Añade el nombre base de tu nuevo modelo aquí
+  ];
+  // --- FIN DE LA MODIFICACIÓN ---
+
   static final MethodChannel _channel =
-      ChannelConfig.createSingleImageChannel();
+  ChannelConfig.createSingleImageChannel();
 
   /// Callback for download progress updates (0.0 to 1.0)
   final void Function(double progress)? onDownloadProgress;
@@ -63,8 +70,8 @@ class ModelManager {
 
   /// Check if a model exists in the iOS bundle
   Future<Map<String, dynamic>> _checkModelExistsInBundle(
-    String modelName,
-  ) async {
+      String modelName,
+      ) async {
     if (!Platform.isIOS) return {'exists': false};
     try {
       final result = await _channel.invokeMethod('checkModelExists', {
@@ -123,6 +130,14 @@ class ModelManager {
       return modelFile.path;
     }
 
+    // --- INICIO DE LA MODIFICACIÓN ---
+    // Si es un modelo custom, no intentes descargarlo.
+    if (_localCustomModels.contains(modelType.modelName)) {
+      _updateStatus('Error: Modelo local ${modelType.modelName} no encontrado en assets/models/');
+      return null;
+    }
+    // --- FIN DE LA MODIFICACIÓN ---
+
     // Download if not found locally or in assets
     _updateStatus('Downloading ${modelType.modelName} model...');
     final bytes = await _downloadFile('$_modelDownloadBaseUrl/$bundledName');
@@ -158,10 +173,10 @@ class ModelManager {
 
   /// Helper method to extract zip file
   Future<String?> _extractZip(
-    List<int> bytes,
-    Directory targetDir,
-    String modelName,
-  ) async {
+      List<int> bytes,
+      Directory targetDir,
+      String modelName,
+      ) async {
     try {
       _updateStatus('Extracting model...');
       final archive = ZipDecoder().decodeBytes(bytes);
@@ -173,7 +188,7 @@ class ModelManager {
             first.split('/').first.endsWith('.mlpackage')) {
           final topDir = first.split('/').first;
           if (archive.files.every(
-            (f) => f.name.startsWith('$topDir/') || f.name == topDir,
+                (f) => f.name.startsWith('$topDir/') || f.name == topDir,
           )) {
             prefix = '$topDir/';
           }
@@ -215,10 +230,10 @@ class ModelManager {
 
   /// Helper method to download and extract model
   Future<String?> _downloadAndExtract(
-    ModelType modelType,
-    Directory targetDir,
-    String ext,
-  ) async {
+      ModelType modelType,
+      Directory targetDir,
+      String ext,
+      ) async {
     final bytes = await _downloadFile(
       '$_modelDownloadBaseUrl/${modelType.modelName}$ext',
     );

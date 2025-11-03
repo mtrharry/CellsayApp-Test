@@ -90,13 +90,65 @@ int? extractImageHeightPx(YOLOResult result) {
   }
 
   for (final candidate in candidates) {
-    final value = _dimensionCandidateToDouble(candidate);
+    final value = _dimensionCandidateToDouble(candidate, isHeight: true);
     if (value != null && value > 1) {
       return value.round();
     }
   }
   return null;
 }
+
+// --- INICIO DE MODIFICACIÓN --- (NUEVA FUNCIÓN)
+int? extractImageWidthPx(YOLOResult result) {
+  final dynamic dynamicResult = result;
+  final candidates = <dynamic?>[
+    _tryValue(() => dynamicResult.imageWidth),
+    _tryValue(() => dynamicResult.imageWidthPx),
+    _tryValue(() => dynamicResult.sourceWidth),
+    _tryValue(() => dynamicResult.frameWidth),
+    _tryValue(() => dynamicResult.inputWidth),
+    _tryValue(() => dynamicResult.imageSize),
+    _tryValue(() => dynamicResult.imageShape),
+    _tryValue(() => dynamicResult.inputShape),
+    _tryValue(() => dynamicResult.originalSize),
+    _tryValue(() => dynamicResult.originalShape),
+  ];
+
+  final map = _mapRepresentation(dynamicResult);
+  if (map != null) {
+    const keys = [
+      'imageWidth',
+      'image_width',
+      'imageWidthPx',
+      'inputWidth',
+      'input_width',
+      'imageShape',
+      'image_shape',
+      'inputShape',
+      'input_shape',
+      'originalSize',
+      'original_size',
+      'originalShape',
+      'original_shape',
+      'sourceWidth',
+      'frameWidth',
+    ];
+    for (final key in keys) {
+      candidates.add(map[key]);
+    }
+    final imageSize = map['imageSize'] ?? map['image_size'];
+    candidates.add(imageSize);
+  }
+
+  for (final candidate in candidates) {
+    final value = _dimensionCandidateToDouble(candidate, isHeight: false);
+    if (value != null && value > 1) {
+      return value.round();
+    }
+  }
+  return null;
+}
+// --- FIN DE MODIFICACIÓN ---
 
 double? extractConfidence(YOLOResult result) {
   final dynamic dynamicResult = result;
@@ -156,32 +208,42 @@ dynamic _tryValue(dynamic Function() getter) {
   }
 }
 
-double? _dimensionCandidateToDouble(dynamic candidate) {
+// --- INICIO DE MODIFICACIÓN --- (FUNCIÓN ACTUALIZADA)
+double? _dimensionCandidateToDouble(dynamic candidate, {required bool isHeight}) {
   if (candidate == null) return null;
   if (candidate is num) return candidate.toDouble();
   if (candidate is String) return double.tryParse(candidate);
   if (candidate is List) {
     if (candidate.isEmpty) return null;
+    // Para 'shape' (alto, ancho), toma el índice correcto
+    if (candidate.length > 1) {
+      final val = isHeight ? candidate[0] : candidate[1];
+      final parsed = _dimensionCandidateToDouble(val, isHeight: isHeight);
+      if (parsed != null) return parsed;
+    }
+    // Para otros listados, busca recursivamente
     for (final value in candidate) {
-      final parsed = _dimensionCandidateToDouble(value);
+      final parsed = _dimensionCandidateToDouble(value, isHeight: isHeight);
       if (parsed != null) return parsed;
     }
     return null;
   }
   if (candidate is Map) {
-    for (final key in ['height', 'h', 'rows']) {
-      final parsed = _dimensionCandidateToDouble(candidate[key]);
+    final keys = isHeight ? ['height', 'h', 'rows'] : ['width', 'w', 'cols'];
+    for (final key in keys) {
+      final parsed = _dimensionCandidateToDouble(candidate[key], isHeight: isHeight);
       if (parsed != null) return parsed;
     }
   }
   if (candidate is Size) {
-    return candidate.height;
+    return isHeight ? candidate.height : candidate.width;
   }
   if (candidate is Rect) {
-    return candidate.height;
+    return isHeight ? candidate.height : candidate.width;
   }
   return null;
 }
+// --- FIN DE MODIFICACIÓN ---
 
 /// Utility to clamp bounding boxes to a sensible range for debugging purposes.
 Rect clampRect(Rect rect) {

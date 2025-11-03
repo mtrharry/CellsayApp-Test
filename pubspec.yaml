@@ -46,6 +46,9 @@ flutter:
     - assets/config/
     - assets/logo.png
     - assets/applogo.png
+    - assets/models/best_float16.tflite
+    - assets/models/carteles.tflite    # <-- AÑADE ESTA LÍNEA
+    - assets/config/calibration.json
 
 flutter_launcher_icons:
   android: true

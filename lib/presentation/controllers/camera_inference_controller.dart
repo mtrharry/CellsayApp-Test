@@ -1,11 +1,22 @@
 import 'dart:async';
 import 'dart:typed_data';
+import 'dart:ui' as ui; // Import para ui.Size
 
+// --- INICIO DE MODIFICACIÓN (Import para 'compute') ---
+import 'package:flutter/foundation.dart';
+// --- FIN DE MODIFICACIÓN ---
 import 'package:flutter/material.dart';
+// Import para ML Kit OCR, escondiendo 'ModelManager' para evitar conflicto
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart'
+    hide ModelManager;
 import 'package:intl/intl.dart';
 import 'package:ultralytics_yolo/models/yolo_result.dart';
 import 'package:ultralytics_yolo/utils/error_handler.dart';
 import 'package:ultralytics_yolo/widgets/yolo_controller.dart';
+// --- INICIO DE MODIFICACIÓN (Importar paquete 'image') ---
+import 'package:image/image.dart' as img;
+// --- FIN DE MODIFICACIÓN ---
+
 import '../../core/vision/detection_distance_extension.dart';
 import '../../core/vision/detection_geometry.dart';
 import '../../core/vision/distance_estimator.dart';
@@ -15,15 +26,28 @@ import '../../models/models.dart';
 import '../../models/voice_settings.dart';
 import '../../services/detection_post_processor.dart';
 import '../../services/depth_inference_service.dart';
-import '../../services/model_manager.dart';
+import '../../services/model_manager.dart'; // Import de tu ModelManager
 import '../../services/voice_announcer.dart';
 import '../../services/voice_command_service.dart';
 import '../../services/weather_service.dart';
 
 /// Controller that manages the state and business logic for camera inference
 class CameraInferenceController extends ChangeNotifier {
-  // Detection state
+  // --- (Nuevas variables para OCR) ---
+  final TextRecognizer _textRecognizer = TextRecognizer();
+  bool _isOcrBusy = false;
+  DateTime _lastOcrTimestamp = DateTime.now();
+  final List<String> _cartelClasses = const [
+    'anuncios informativos',
+    'anuncios publicitarios',
+    'carteles de comida',
+    'letrero direccion',
+    'letrero tienda',
+    'publicidad de comida',
+  ];
+  // --- (FIN Nuevas variables para OCR) ---
 
+  // --- VARIABLES ORIGINALES ---
   int _detectionCount = 0;
   double _currentFps = 0.0;
   int _frameCount = 0;
@@ -32,21 +56,15 @@ class CameraInferenceController extends ChangeNotifier {
   DateTime? _lastNonEmptyResult;
   ProcessedDetections _processedDetections = ProcessedDetections.empty;
   SafetyAlerts _safetyAlerts = const SafetyAlerts();
-
-  // Threshold state
   double _confidenceThreshold;
   double _iouThreshold = 0.45;
   int _numItemsThreshold;
   SliderType _activeSlider = SliderType.none;
-
-  // Model state
   ModelType _selectedModel;
   bool _isModelLoading = false;
   String? _modelPath;
   String _loadingMessage = '';
   double _downloadProgress = 0.0;
-
-  // Camera state
   double _currentZoomLevel = 1.0;
   bool _isFrontCamera = false;
   bool _isVoiceEnabled = true;
@@ -57,8 +75,6 @@ class CameraInferenceController extends ChangeNotifier {
   bool _isListeningForCommand = false;
   bool _isVoiceFeedbackPaused = false;
   bool _isProcessingVoiceCommand = false;
-
-  // Controllers
   final _yoloController = YOLOViewController();
   late final ModelManager _modelManager;
   final DetectionPostProcessor _postProcessor = DetectionPostProcessor();
@@ -72,8 +88,6 @@ class CameraInferenceController extends ChangeNotifier {
   DepthInferenceService? _depthService;
   DepthFrame? _latestDepthFrame;
   bool _isDepthProcessingEnabled = false;
-
-  // Performance optimization
   bool _isDisposed = false;
   Future<void>? _loadingFuture;
   Timer? _statusTimer;
@@ -82,8 +96,9 @@ class CameraInferenceController extends ChangeNotifier {
   DateTime _lastWeatherFetch = DateTime.fromMillisecondsSinceEpoch(0);
   String? _connectionAlert;
   String? _cameraAlert;
+  // --- FIN DE VARIABLES ORIGINALES ---
 
-  // Getters
+  // --- GETTERS ORIGINALES ---
   int get detectionCount => _detectionCount;
   double get currentFps => _currentFps;
   double get confidenceThreshold => _confidenceThreshold;
@@ -116,6 +131,7 @@ class CameraInferenceController extends ChangeNotifier {
   YOLOViewController get yoloController => _yoloController;
   bool get isDepthProcessingEnabled => _isDepthProcessingEnabled;
   bool get isDepthServiceAvailable => _depthService != null;
+  // --- FIN DE GETTERS ORIGINALES ---
 
   CameraInferenceController({ModelType initialModel = ModelType.Interior})
       : _selectedModel = initialModel,
@@ -148,6 +164,8 @@ class CameraInferenceController extends ChangeNotifier {
       case ModelType.Interior:
       case ModelType.Exterior:
         return 0.5;
+      case ModelType.LectorCarteles:
+        return 0.45;
     }
   }
 
@@ -156,6 +174,8 @@ class CameraInferenceController extends ChangeNotifier {
       case ModelType.Interior:
       case ModelType.Exterior:
         return 30;
+      case ModelType.LectorCarteles:
+        return 10;
     }
   }
 
@@ -171,7 +191,7 @@ class CameraInferenceController extends ChangeNotifier {
   }
 
   /// Handle detection results and calculate FPS
-  void onDetectionResults(List<YOLOResult> results) {
+  void onDetectionResults(List<YOLOResult> results, Uint8List? originalImage) {
     if (_isDisposed) return;
 
     _annotateDistances(results);
@@ -234,6 +254,26 @@ class CameraInferenceController extends ChangeNotifier {
     if (shouldNotify) {
       notifyListeners();
     }
+
+    // --- Lógica de OCR ---
+    if (_selectedModel == ModelType.LectorCarteles &&
+        originalImage != null &&
+        !_isOcrBusy &&
+        processed.filteredResults.isNotEmpty) {
+      final now = DateTime.now();
+      if (now.difference(_lastOcrTimestamp).inMilliseconds > 1500) {
+        _isOcrBusy = true;
+        _lastOcrTimestamp = now;
+
+        unawaited(_runOcrOnDetections(originalImage, processed, now)
+            .catchError((e) {
+          debugPrint("Error ejecutando OCR: $e");
+        }).whenComplete(() {
+          _isOcrBusy = false;
+        }));
+      }
+    }
+    // --- Fin Lógica de OCR ---
 
     unawaited(
       _voiceAnnouncer.processDetections(
@@ -317,8 +357,106 @@ class CameraInferenceController extends ChangeNotifier {
     }
 
     if (_isDisposed) return;
-    onDetectionResults(results);
+    onDetectionResults(results, originalImage);
   }
+
+  // --- INICIO DE MODIFICACIÓN (Función de OCR corregida) ---
+  /// Ejecuta el OCR sobre la imagen y anuncia los resultados
+  Future<void> _runOcrOnDetections(
+      Uint8List imageBytes, // Esto es un JPEG comprimido
+      ProcessedDetections processed,
+      DateTime detectionTime,
+      ) async {
+    if (_isDisposed) return;
+
+    final cartelDetections = processed.filteredResults
+        .where((d) => _cartelClasses.contains(extractLabel(d).toLowerCase()))
+        .toList();
+
+    if (cartelDetections.isEmpty) return;
+
+    // --- (Decodificar JPEG) ---
+
+    // 1. Decodificar la imagen JPEG en memoria
+    // Usamos compute para hacerlo en un Isolate separado y no bloquear la UI
+    final img.Image? decodedImage = await compute(img.decodeImage, imageBytes);
+
+    if (decodedImage == null) {
+      debugPrint("OCR Error: No se pudo decodificar la imagen JPEG.");
+      return;
+    }
+    if (_isDisposed) return; // Comprobar de nuevo después del 'await'
+
+    // 2. Obtener los bytes crudos en formato RGBA
+    // --- INICIO DE CORRECCIÓN (toUint8List) ---
+    // Esta es la forma correcta de obtener los bytes RGBA crudos en image: 4.x
+    final Uint8List rawRgbaBytes = decodedImage.toUint8List();
+    // --- FIN DE CORRECCIÓN (toUint8List) ---
+    final int imageWidth = decodedImage.width;
+    final int imageHeight = decodedImage.height;
+
+    // 3. Crear la metadata para la imagen cruda (RAW)
+    final metadata = InputImageMetadata(
+      size: ui.Size(imageWidth.toDouble(), imageHeight.toDouble()),
+      rotation: InputImageRotation.rotation0deg, // La imagen decodificada ya está derecha
+      format: InputImageFormat.bgra8888, // Especificamos el formato que ML Kit espera
+      bytesPerRow: imageWidth * 4, // 4 bytes por píxel (RGBA)
+    );
+
+    // 4. Crear el InputImage desde los bytes crudos (rawRgbaBytes)
+    final inputImage = InputImage.fromBytes(
+      bytes: rawRgbaBytes,
+      metadata: metadata,
+    );
+
+    // --- (Fin Decodificar JPEG) ---
+
+    // 5. Procesar la imagen completa para OCR
+    final RecognizedText recognizedText =
+    await _textRecognizer.processImage(inputImage);
+
+    if (_isDisposed) return;
+
+    // 6. Mapear texto a carteles
+    String ocrAnnouncement = "";
+
+    for (final cartel in cartelDetections) {
+      final cartelRect = extractBoundingBox(cartel); // Rect de 0.0 a 1.0
+      if (cartelRect == null) continue;
+
+      String textoDelCartel = "";
+      for (final block in recognizedText.blocks) {
+        // Convertir BoundingBox de MLKit (pixeles) a Rect normalizado
+        final blockRect = Rect.fromLTWH(
+          block.boundingBox.left / imageWidth,
+          block.boundingBox.top / imageHeight,
+          block.boundingBox.width / imageWidth,
+          block.boundingBox.height / imageHeight,
+        );
+
+        // 7. Comprobar si el texto está (parcialmente) dentro del cartel
+        if (cartelRect.overlaps(blockRect)) {
+          textoDelCartel += block.text.replaceAll('\n', ' ') + " ";
+        }
+      }
+
+      if (textoDelCartel.trim().isNotEmpty) {
+        // 8. Combinar el anuncio (usando extractLabel)
+        final label = extractLabel(cartel, fallback: "cartel");
+        ocrAnnouncement += "Detecté un $label. Dice: ${textoDelCartel.trim()}. ";
+      }
+    }
+
+    // 9. Anunciar el texto del OCR (si es nuevo)
+    if (ocrAnnouncement.isNotEmpty) {
+      await _announceSystemMessage(
+        ocrAnnouncement,
+        force: true,
+        bypassCooldown: true,
+      );
+    }
+  }
+  // --- FIN DE MODIFICACIÓN ---
 
   void _annotateDistances(List<YOLOResult> results) {
     if (results.isEmpty) return;
@@ -353,10 +491,12 @@ class CameraInferenceController extends ChangeNotifier {
 
       double? geometricDistance;
       if (estimator != null) {
-        geometricDistance = _estimateGeometricDistance(result, estimator, label);
+        geometricDistance =
+            _estimateGeometricDistance(result, estimator, label);
       }
 
-      result.distanceM = _combineDistanceEstimates(depthDistance, geometricDistance);
+      result.distanceM =
+          _combineDistanceEstimates(depthDistance, geometricDistance);
     }
   }
 
@@ -368,27 +508,31 @@ class CameraInferenceController extends ChangeNotifier {
   }
 
   double? _estimateGeometricDistance(
-    YOLOResult result,
-    DistanceEstimator estimator,
-    String label,
-  ) {
+      YOLOResult result,
+      DistanceEstimator estimator,
+      String label,
+      ) {
     final rect = extractBoundingBox(result);
-    final imageHeight = extractImageHeightPx(result);
+    // --- INICIO DE CORRECCIÓN (FALLBACK) ---
+    final imageHeight = extractImageHeightPx(result) ?? 480;
+    // --- FIN DE CORRECCIÓN (FALLBACK) ---
 
     if (rect == null) {
       debugPrint('DistanceEstimator: sin bounding box para $label.');
       return null;
     }
 
-    if (imageHeight == null || imageHeight <= 0) {
+    if (imageHeight <= 0) { // Quitado el chequeo de null
       debugPrint('DistanceEstimator: sin altura de imagen para $label.');
       return null;
     }
 
     var bboxHeightRelative = rect.height;
-    if (bboxHeightRelative.isNaN || bboxHeightRelative.isInfinite ||
+    if (bboxHeightRelative.isNaN ||
+        bboxHeightRelative.isInfinite ||
         bboxHeightRelative <= 0) {
-      debugPrint('DistanceEstimator: altura inválida de bounding box para $label.');
+      debugPrint(
+          'DistanceEstimator: altura inválida de bounding box para $label.');
       return null;
     }
 
@@ -621,7 +765,14 @@ class CameraInferenceController extends ChangeNotifier {
     bool recognized = false;
     bool repeatInstruction = false;
 
-    final textKeywords = ['letra', 'letras', 'fuente', 'texto', 'tamano', 'tamanos'];
+    final textKeywords = [
+      'letra',
+      'letras',
+      'fuente',
+      'texto',
+      'tamano',
+      'tamanos'
+    ];
     final voiceKeywords = ['voz', 'narr', 'locucion', 'audio', 'asistente'];
 
     if (_commandContainsAny(normalized, [
@@ -637,8 +788,7 @@ class CameraInferenceController extends ChangeNotifier {
       recognized = true;
       feedback = 'Repitiendo la última instrucción.';
       repeatInstruction = true;
-    } else if (
-    _commandContainsAny(normalized, [
+    } else if (_commandContainsAny(normalized, [
       'sube',
       'aumenta',
       'incrementa',
@@ -658,8 +808,7 @@ class CameraInferenceController extends ChangeNotifier {
       recognized = true;
       increaseFontScale();
       feedback = 'Aumentando tamaño de texto.';
-    } else if (
-    _commandContainsAny(normalized, [
+    } else if (_commandContainsAny(normalized, [
       'baja',
       'bajar',
       'disminuye',
@@ -690,8 +839,15 @@ class CameraInferenceController extends ChangeNotifier {
       recognized = true;
       feedback =
       'Puedes pedirme que repita instrucciones, cambiar el tamaño de texto, activar o desactivar la narración, conocer los objetos detectados, preguntar la hora o consultar el clima.';
-    } else if (
-    _commandContainsAny(normalized, ['activa', 'enciende', 'habilita', 'activar', 'pon', 'enciendelo', 'prende']) &&
+    } else if (_commandContainsAny(normalized, [
+      'activa',
+      'enciende',
+      'habilita',
+      'activar',
+      'pon',
+      'enciendelo',
+      'prende'
+    ]) &&
         _commandContainsAny(normalized, voiceKeywords)) {
       recognized = true;
       if (_isVoiceEnabled) {
@@ -700,8 +856,16 @@ class CameraInferenceController extends ChangeNotifier {
         toggleVoice(announce: false);
         feedback = 'Narración activada.';
       }
-    } else if (
-    _commandContainsAny(normalized, ['desactiva', 'apaga', 'silencia', 'silencio', 'deshabilita', 'quita', 'calla', 'apagala']) &&
+    } else if (_commandContainsAny(normalized, [
+      'desactiva',
+      'apaga',
+      'silencia',
+      'silencio',
+      'deshabilita',
+      'quita',
+      'calla',
+      'apagala'
+    ]) &&
         _commandContainsAny(normalized, voiceKeywords)) {
       recognized = true;
       if (_isVoiceEnabled) {
@@ -880,10 +1044,13 @@ class CameraInferenceController extends ChangeNotifier {
     try {
       await handleVoiceCommand(text);
     } finally {
-      if (_isDisposed) return;
-      _isProcessingVoiceCommand = false;
-      _setVoiceFeedbackPaused(false);
-      notifyListeners();
+      if (_isDisposed) {
+        // No hacer nada si está 'disposed'
+      } else {
+        _isProcessingVoiceCommand = false;
+        _setVoiceFeedbackPaused(false);
+        notifyListeners();
+      }
     }
   }
 
@@ -894,7 +1061,8 @@ class CameraInferenceController extends ChangeNotifier {
     final wasListening = _isListeningForCommand;
     _isListeningForCommand = false;
     _setVoiceFeedbackPaused(false);
-    _voiceCommandStatus = wasListening ? 'Escucha cancelada.' : _voiceCommandStatus;
+    _voiceCommandStatus =
+    wasListening ? 'Escucha cancelada.' : _voiceCommandStatus;
     notifyListeners();
     if (wasListening) {
       unawaited(
@@ -1044,7 +1212,8 @@ class CameraInferenceController extends ChangeNotifier {
     if (_isDisposed) return;
 
     final now = DateTime.now();
-    if (!force && now.difference(_lastWeatherFetch) < const Duration(minutes: 15)) {
+    if (!force &&
+        now.difference(_lastWeatherFetch) < const Duration(minutes: 15)) {
       return;
     }
 
@@ -1159,6 +1328,9 @@ class CameraInferenceController extends ChangeNotifier {
     unawaited(_depthService?.dispose());
     _depthService = null;
     _latestDepthFrame = null;
+    // --- INICIO DE MODIFICACIÓN ---
+    _textRecognizer.close(); // Liberar recursos del OCR
+    // --- FIN DE MODIFICACIÓN ---
     super.dispose();
   }
 }

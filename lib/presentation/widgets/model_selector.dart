@@ -1,4 +1,3 @@
-
 import 'package:flutter/material.dart';
 import '../../models/models.dart';
 
@@ -24,15 +23,21 @@ class ModelSelector extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Container(
-          height: 36,
+          // --- INICIO DE MODIFICACIÓN ---
+          // Se quita la altura fija 'height: 36' para permitir que el Wrap crezca
+          // --- FIN DE MODIFICACIÓN ---
           padding: const EdgeInsets.all(2),
           decoration: BoxDecoration(
             color: Colors.black.withValues(alpha: 0.6),
             borderRadius: BorderRadius.circular(8),
           ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
+          // --- INICIO DE MODIFICACIÓN ---
+          // Se cambió 'Row' por 'Wrap' para que los botones salten de línea
+          child: Wrap(
+            spacing: 2.0, // Espacio horizontal entre botones
+            runSpacing: 2.0, // Espacio vertical si saltan de línea
             children: ModelType.values.map((model) {
+              // --- FIN DE MODIFICACIÓN ---
               final isSelected = selectedModel == model;
               return GestureDetector(
                 onTap: () {
@@ -42,7 +47,7 @@ class ModelSelector extends StatelessWidget {
                 },
                 child: Container(
                   padding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                  const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
                   decoration: BoxDecoration(
                     color: isSelected ? Colors.white : Colors.transparent,
                     borderRadius: BorderRadius.circular(6),
