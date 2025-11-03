@@ -37,6 +37,8 @@ class CameraInferenceController extends ChangeNotifier {
   final TextRecognizer _textRecognizer = TextRecognizer();
   bool _isOcrBusy = false;
   DateTime _lastOcrTimestamp = DateTime.now();
+  String? _lastOcrAnnouncement;
+  DateTime? _lastOcrAnnouncementTime;
   final List<String> _cartelClasses = const [
     'anuncios informativos',
     'anuncios publicitarios',
@@ -391,6 +393,7 @@ class CameraInferenceController extends ChangeNotifier {
     // --- INICIO DE CORRECCIÓN (toUint8List) ---
     // Esta es la forma correcta de obtener los bytes RGBA crudos en image: 4.x
     final Uint8List rawRgbaBytes = decodedImage.toUint8List();
+    final Uint8List rawBgraBytes = _ensureBgraOrder(rawRgbaBytes);
     // --- FIN DE CORRECCIÓN (toUint8List) ---
     final int imageWidth = decodedImage.width;
     final int imageHeight = decodedImage.height;
@@ -400,12 +403,12 @@ class CameraInferenceController extends ChangeNotifier {
       size: ui.Size(imageWidth.toDouble(), imageHeight.toDouble()),
       rotation: InputImageRotation.rotation0deg, // La imagen decodificada ya está derecha
       format: InputImageFormat.bgra8888, // Especificamos el formato que ML Kit espera
-      bytesPerRow: imageWidth * 4, // 4 bytes por píxel (RGBA)
+      bytesPerRow: imageWidth * 4, // 4 bytes por píxel (BGRA)
     );
 
     // 4. Crear el InputImage desde los bytes crudos (rawRgbaBytes)
     final inputImage = InputImage.fromBytes(
-      bytes: rawRgbaBytes,
+      bytes: rawBgraBytes,
       metadata: metadata,
     );
 
@@ -420,9 +423,28 @@ class CameraInferenceController extends ChangeNotifier {
     // 6. Mapear texto a carteles
     String ocrAnnouncement = "";
 
+    final normalizedDetections = <_OcrCartelTarget>[];
     for (final cartel in cartelDetections) {
-      final cartelRect = extractBoundingBox(cartel); // Rect de 0.0 a 1.0
+      final cartelRect = extractBoundingBox(cartel);
       if (cartelRect == null) continue;
+
+      final normalizedRect =
+          _normalizeDetectionRect(cartelRect, imageWidth, imageHeight);
+      if (normalizedRect == null) continue;
+
+      normalizedDetections.add(_OcrCartelTarget(
+        detection: cartel,
+        normalizedRect: normalizedRect,
+      ));
+    }
+
+    if (normalizedDetections.isEmpty) {
+      return;
+    }
+
+    for (final target in normalizedDetections) {
+      final Rect cartelRect = target.normalizedRect;
+      final Rect expandedCartelRect = _expandNormalizedRect(cartelRect, 0.02);
 
       String textoDelCartel = "";
       for (final block in recognizedText.blocks) {
@@ -435,28 +457,117 @@ class CameraInferenceController extends ChangeNotifier {
         );
 
         // 7. Comprobar si el texto está (parcialmente) dentro del cartel
-        if (cartelRect.overlaps(blockRect)) {
+        if (expandedCartelRect.overlaps(blockRect)) {
           textoDelCartel += block.text.replaceAll('\n', ' ') + " ";
         }
       }
 
       if (textoDelCartel.trim().isNotEmpty) {
         // 8. Combinar el anuncio (usando extractLabel)
-        final label = extractLabel(cartel, fallback: "cartel");
+        final label = extractLabel(target.detection, fallback: "cartel");
         ocrAnnouncement += "Detecté un $label. Dice: ${textoDelCartel.trim()}. ";
       }
     }
 
     // 9. Anunciar el texto del OCR (si es nuevo)
     if (ocrAnnouncement.isNotEmpty) {
-      await _announceSystemMessage(
-        ocrAnnouncement,
-        force: true,
-        bypassCooldown: true,
-      );
+      final normalizedAnnouncement = ocrAnnouncement.trim();
+      final isDuplicate = normalizedAnnouncement == _lastOcrAnnouncement &&
+          _lastOcrAnnouncementTime != null &&
+          detectionTime
+                  .difference(_lastOcrAnnouncementTime!)
+                  .inMilliseconds <
+              4000;
+
+      if (!isDuplicate) {
+        _lastOcrAnnouncement = normalizedAnnouncement;
+        _lastOcrAnnouncementTime = detectionTime;
+
+        await _announceSystemMessage(
+          ocrAnnouncement,
+          force: true,
+          bypassCooldown: true,
+        );
+      }
     }
   }
   // --- FIN DE MODIFICACIÓN ---
+
+  Rect? _normalizeDetectionRect(
+    Rect rect,
+    int imageWidth,
+    int imageHeight,
+  ) {
+    if (rect.width <= 0 || rect.height <= 0) {
+      return null;
+    }
+
+    const double normalizedUpperBound = 1.2;
+    final bool looksNormalized =
+        rect.left >= -0.1 &&
+        rect.top >= -0.1 &&
+        rect.right <= normalizedUpperBound &&
+        rect.bottom <= normalizedUpperBound;
+
+    Rect normalizedRect;
+    if (looksNormalized) {
+      normalizedRect = rect;
+    } else {
+      final double width = imageWidth.toDouble();
+      final double height = imageHeight.toDouble();
+      if (width <= 0 || height <= 0) {
+        return null;
+      }
+      normalizedRect = Rect.fromLTRB(
+        rect.left / width,
+        rect.top / height,
+        rect.right / width,
+        rect.bottom / height,
+      );
+    }
+
+    final double left = normalizedRect.left.clamp(0.0, 1.0);
+    final double top = normalizedRect.top.clamp(0.0, 1.0);
+    final double right = normalizedRect.right.clamp(0.0, 1.0);
+    final double bottom = normalizedRect.bottom.clamp(0.0, 1.0);
+
+    if (right - left <= 1e-6 || bottom - top <= 1e-6) {
+      return null;
+    }
+
+    return Rect.fromLTRB(left, top, right, bottom);
+  }
+
+  Rect _expandNormalizedRect(Rect rect, double padding) {
+    final double left = (rect.left - padding).clamp(0.0, 1.0);
+    final double top = (rect.top - padding).clamp(0.0, 1.0);
+    final double right = (rect.right + padding).clamp(0.0, 1.0);
+    final double bottom = (rect.bottom + padding).clamp(0.0, 1.0);
+
+    if (right - left <= 1e-6 || bottom - top <= 1e-6) {
+      return rect;
+    }
+
+    return Rect.fromLTRB(left, top, right, bottom);
+  }
+
+  Uint8List _ensureBgraOrder(Uint8List rgbaBytes) {
+    if (rgbaBytes.length < 4) {
+      return rgbaBytes;
+    }
+
+    // Los bytes producidos por el paquete `image` están en RGBA. ML Kit
+    // espera BGRA cuando usamos `InputImageFormat.bgra8888`, por lo que
+    // reordenamos los canales cuando sea necesario.
+    final Uint8List bgraBytes = Uint8List(rgbaBytes.length);
+    for (int i = 0; i < rgbaBytes.length; i += 4) {
+      bgraBytes[i] = rgbaBytes[i + 2];
+      bgraBytes[i + 1] = rgbaBytes[i + 1];
+      bgraBytes[i + 2] = rgbaBytes[i];
+      bgraBytes[i + 3] = rgbaBytes[i + 3];
+    }
+    return bgraBytes;
+  }
 
   void _annotateDistances(List<YOLOResult> results) {
     if (results.isEmpty) return;
@@ -1333,4 +1444,14 @@ class CameraInferenceController extends ChangeNotifier {
     // --- FIN DE MODIFICACIÓN ---
     super.dispose();
   }
+}
+
+class _OcrCartelTarget {
+  const _OcrCartelTarget({
+    required this.detection,
+    required this.normalizedRect,
+  });
+
+  final YOLOResult detection;
+  final Rect normalizedRect;
 }
