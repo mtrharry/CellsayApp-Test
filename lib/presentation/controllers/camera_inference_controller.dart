@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui; // Import para ui.Size
 
@@ -37,8 +38,6 @@ class CameraInferenceController extends ChangeNotifier {
   final TextRecognizer _textRecognizer = TextRecognizer();
   bool _isOcrBusy = false;
   DateTime _lastOcrTimestamp = DateTime.now();
-  String? _lastOcrAnnouncement;
-  DateTime? _lastOcrAnnouncementTime;
   final List<String> _cartelClasses = const [
     'anuncios informativos',
     'anuncios publicitarios',
@@ -47,6 +46,13 @@ class CameraInferenceController extends ChangeNotifier {
     'letrero tienda',
     'publicidad de comida',
   ];
+  static const Duration _cartelPromptCooldown = Duration(seconds: 8);
+  static const int _maxCartelConfirmationAttempts = 2;
+  List<_CartelReading> _pendingCartelReadings = const [];
+  bool _awaitingCartelResponse = false;
+  bool _isListeningForSignage = false;
+  DateTime? _lastCartelPromptTime;
+  int _cartelConfirmationAttempts = 0;
   // --- (FIN Nuevas variables para OCR) ---
 
   // --- VARIABLES ORIGINALES ---
@@ -421,8 +427,6 @@ class CameraInferenceController extends ChangeNotifier {
     if (_isDisposed) return;
 
     // 6. Mapear texto a carteles
-    String ocrAnnouncement = "";
-
     final normalizedDetections = <_OcrCartelTarget>[];
     for (final cartel in cartelDetections) {
       final cartelRect = extractBoundingBox(cartel);
@@ -441,6 +445,8 @@ class CameraInferenceController extends ChangeNotifier {
     if (normalizedDetections.isEmpty) {
       return;
     }
+
+    final List<_CartelReading> newReadings = [];
 
     for (final target in normalizedDetections) {
       final Rect cartelRect = target.normalizedRect;
@@ -462,34 +468,22 @@ class CameraInferenceController extends ChangeNotifier {
         }
       }
 
-      if (textoDelCartel.trim().isNotEmpty) {
-        // 8. Combinar el anuncio (usando extractLabel)
-        final label = extractLabel(target.detection, fallback: "cartel");
-        ocrAnnouncement += "Detecté un $label. Dice: ${textoDelCartel.trim()}. ";
-      }
+      final label = extractLabel(target.detection, fallback: "cartel");
+      final capturedImage = _captureCartelImage(
+        decodedImage,
+        expandedCartelRect,
+      );
+
+      newReadings.add(
+        _CartelReading(
+          label: label,
+          text: textoDelCartel.trim(),
+          imageBytes: capturedImage,
+        ),
+      );
     }
 
-    // 9. Anunciar el texto del OCR (si es nuevo)
-    if (ocrAnnouncement.isNotEmpty) {
-      final normalizedAnnouncement = ocrAnnouncement.trim();
-      final isDuplicate = normalizedAnnouncement == _lastOcrAnnouncement &&
-          _lastOcrAnnouncementTime != null &&
-          detectionTime
-                  .difference(_lastOcrAnnouncementTime!)
-                  .inMilliseconds <
-              4000;
-
-      if (!isDuplicate) {
-        _lastOcrAnnouncement = normalizedAnnouncement;
-        _lastOcrAnnouncementTime = detectionTime;
-
-        await _announceSystemMessage(
-          ocrAnnouncement,
-          force: true,
-          bypassCooldown: true,
-        );
-      }
-    }
+    await _handleCartelReadings(newReadings, detectionTime);
   }
   // --- FIN DE MODIFICACIÓN ---
 
@@ -549,6 +543,289 @@ class CameraInferenceController extends ChangeNotifier {
     }
 
     return Rect.fromLTRB(left, top, right, bottom);
+  }
+
+  Uint8List? _captureCartelImage(img.Image source, Rect normalizedRect) {
+    if (source.width <= 0 || source.height <= 0) {
+      return null;
+    }
+
+    final double leftPx = normalizedRect.left.clamp(0.0, 1.0) * source.width;
+    final double topPx = normalizedRect.top.clamp(0.0, 1.0) * source.height;
+    final double rightPx = normalizedRect.right.clamp(0.0, 1.0) * source.width;
+    final double bottomPx = normalizedRect.bottom.clamp(0.0, 1.0) * source.height;
+
+    final int x0 = math.max(0, math.min(source.width - 1, leftPx.floor()));
+    final int y0 = math.max(0, math.min(source.height - 1, topPx.floor()));
+    final int x1 = math.max(x0 + 1, math.min(source.width, rightPx.ceil()));
+    final int y1 = math.max(y0 + 1, math.min(source.height, bottomPx.ceil()));
+
+    final int width = math.max(1, math.min(source.width - x0, x1 - x0));
+    final int height = math.max(1, math.min(source.height - y0, y1 - y0));
+
+    try {
+      final img.Image cropped = img.copyCrop(
+        source,
+        x: x0,
+        y: y0,
+        width: width,
+        height: height,
+      );
+      return Uint8List.fromList(img.encodeJpg(cropped));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _handleCartelReadings(
+    List<_CartelReading> readings,
+    DateTime detectionTime,
+  ) async {
+    if (_isDisposed || readings.isEmpty) {
+      return;
+    }
+
+    final bool changed = _cartelReadingsDiffer(_pendingCartelReadings, readings);
+    _pendingCartelReadings = readings;
+
+    if (!changed && (_awaitingCartelResponse || _isListeningForSignage)) {
+      return;
+    }
+
+    final lastPrompt = _lastCartelPromptTime;
+    if (!changed && lastPrompt != null) {
+      final elapsed = detectionTime.difference(lastPrompt);
+      if (elapsed < _cartelPromptCooldown) {
+        return;
+      }
+    }
+
+    if (!changed) {
+      return;
+    }
+
+    if (lastPrompt != null &&
+        detectionTime.difference(lastPrompt) < _cartelPromptCooldown) {
+      return;
+    }
+
+    _lastCartelPromptTime = detectionTime;
+    _cartelConfirmationAttempts = 0;
+    _awaitingCartelResponse = true;
+    _setVoiceFeedbackPaused(true);
+
+    final int count = readings.length;
+    final String prompt = count == 1
+        ? 'Detecté un letrero. ¿Quieres que lo lea?'
+        : 'Detecté $count letreros. ¿Quieres que los lea?';
+
+    await _announceSystemMessage(
+      prompt,
+      force: true,
+      bypassCooldown: true,
+    );
+
+    if (_isDisposed) {
+      return;
+    }
+
+    await _listenForCartelConfirmation();
+  }
+
+  bool _cartelReadingsDiffer(
+    List<_CartelReading> previous,
+    List<_CartelReading> current,
+  ) {
+    if (previous.length != current.length) {
+      return true;
+    }
+    for (var i = 0; i < current.length; i++) {
+      if (!previous[i].isSameContent(current[i])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  Future<void> _listenForCartelConfirmation({bool retry = false}) async {
+    if (_isDisposed || !_awaitingCartelResponse) {
+      return;
+    }
+
+    if (_voiceCommandService.isListening) {
+      await _voiceCommandService.cancelListening();
+    }
+
+    _isListeningForSignage = true;
+    _voiceCommandStatus = retry
+        ? 'No entendí, por favor responde sí o no.'
+        : 'Escuchando respuesta sobre los letreros...';
+    notifyListeners();
+
+    final started = await _voiceCommandService.startListening(
+      onResult: (text) {
+        if (_isDisposed) return;
+        unawaited(_processCartelConfirmation(text));
+      },
+      onError: (message) {
+        if (_isDisposed) return;
+        unawaited(_handleCartelConfirmationError(message));
+      },
+      onStatus: (listening) {
+        if (_isDisposed) return;
+        _isListeningForSignage = listening;
+        if (!listening && _awaitingCartelResponse) {
+          notifyListeners();
+        }
+      },
+      listenFor: const Duration(seconds: 5),
+      pauseFor: const Duration(seconds: 2),
+    );
+
+    if (!started && !_isDisposed) {
+      await _handleCartelConfirmationError(
+        'No pude iniciar la escucha de la respuesta.',
+      );
+    }
+  }
+
+  Future<void> _processCartelConfirmation(String text) async {
+    if (_isDisposed || !_awaitingCartelResponse) {
+      return;
+    }
+
+    await _voiceCommandService.stopListening();
+
+    final normalized = _normalizeVoiceCommand(text);
+    bool? wantsReading;
+
+    if (_commandContainsAny(normalized, [
+      'si',
+      'claro',
+      'lee',
+      'leer',
+      'por favor',
+      'adelante',
+    ])) {
+      wantsReading = true;
+    } else if (_commandContainsAny(normalized, [
+      'no',
+      'luego',
+      'despues',
+      'negativo',
+    ])) {
+      wantsReading = false;
+    }
+
+    if (wantsReading == null) {
+      _cartelConfirmationAttempts++;
+      if (_cartelConfirmationAttempts <= _maxCartelConfirmationAttempts) {
+        await _announceSystemMessage(
+          'No entendí la respuesta. Por favor responde sí o no.',
+          force: true,
+          bypassCooldown: true,
+        );
+        if (_isDisposed) return;
+        await _listenForCartelConfirmation(retry: true);
+        return;
+      }
+
+      await _announceSystemMessage(
+        'No pude confirmar si deseas la lectura de los letreros.',
+        force: true,
+        bypassCooldown: true,
+      );
+      await _finishCartelPrompt();
+      return;
+    }
+
+    if (wantsReading) {
+      await _announceSystemMessage(
+        'Muy bien, leyendo los letreros.',
+        force: true,
+        bypassCooldown: true,
+      );
+      if (_isDisposed) return;
+      await _readPendingCartelTexts();
+      await _finishCartelPrompt(clearPending: true);
+    } else {
+      await _announceSystemMessage(
+        'De acuerdo, no leeré los letreros ahora.',
+        force: true,
+        bypassCooldown: true,
+      );
+      await _finishCartelPrompt();
+    }
+  }
+
+  Future<void> _handleCartelConfirmationError(String message) async {
+    if (_isDisposed) {
+      return;
+    }
+
+    _voiceCommandStatus = message;
+    notifyListeners();
+
+    await _announceSystemMessage(
+      message,
+      force: true,
+      bypassCooldown: true,
+    );
+
+    await _finishCartelPrompt();
+  }
+
+  Future<void> _finishCartelPrompt({bool clearPending = false}) async {
+    if (_voiceCommandService.isListening) {
+      await _voiceCommandService.cancelListening();
+    }
+
+    if (_isDisposed) {
+      return;
+    }
+
+    _awaitingCartelResponse = false;
+    _isListeningForSignage = false;
+    _cartelConfirmationAttempts = 0;
+    if (clearPending) {
+      _pendingCartelReadings = const [];
+    }
+    _voiceCommandStatus = null;
+    _setVoiceFeedbackPaused(false);
+    notifyListeners();
+  }
+
+  Future<void> _readPendingCartelTexts() async {
+    if (_pendingCartelReadings.isEmpty) {
+      await _announceSystemMessage(
+        'No tengo texto legible en los letreros.',
+        force: true,
+        bypassCooldown: true,
+      );
+      return;
+    }
+
+    final total = _pendingCartelReadings.length;
+    for (var i = 0; i < total; i++) {
+      final reading = _pendingCartelReadings[i];
+      final prefix = total > 1 ? 'Letrero ${i + 1}' : 'El letrero';
+      final description = reading.label.isNotEmpty
+          ? '$prefix (${reading.label.toLowerCase()})'
+          : prefix;
+      final message = reading.hasText
+          ? '$description dice: ${reading.text}.'
+          : '$description no tiene texto legible.';
+
+      await _announceSystemMessage(
+        message,
+        force: true,
+        bypassCooldown: true,
+      );
+
+      if (_isDisposed) {
+        return;
+      }
+    }
   }
 
   Uint8List _ensureBgraOrder(Uint8List rgbaBytes) {
@@ -810,6 +1087,13 @@ class CameraInferenceController extends ChangeNotifier {
   void onVoiceCommandRequested() {
     if (_isDisposed || _areControlsLocked) return;
 
+    if (_awaitingCartelResponse || _isListeningForSignage) {
+      _voiceCommandStatus =
+          'Primero responde si deseas que lea los letreros.';
+      notifyListeners();
+      return;
+    }
+
     if (_isListeningForCommand) {
       unawaited(_cancelVoiceCommand());
     } else {
@@ -819,6 +1103,13 @@ class CameraInferenceController extends ChangeNotifier {
 
   void onVoiceCommandHoldStart() {
     if (_isDisposed || _areControlsLocked) return;
+
+    if (_awaitingCartelResponse || _isListeningForSignage) {
+      _voiceCommandStatus =
+          'Necesito tu respuesta sobre los letreros antes de otros comandos.';
+      notifyListeners();
+      return;
+    }
 
     if (_voiceCommandService.isListening || _isListeningForCommand) {
       return;
@@ -1086,6 +1377,13 @@ class CameraInferenceController extends ChangeNotifier {
 
   Future<void> _startVoiceCommand() async {
     if (_isDisposed) return;
+
+    if (_awaitingCartelResponse || _isListeningForSignage) {
+      _voiceCommandStatus =
+          'Responde primero si deseas que lea los letreros.';
+      notifyListeners();
+      return;
+    }
 
     _isListeningForCommand = true;
     _setVoiceFeedbackPaused(true);
@@ -1454,4 +1752,23 @@ class _OcrCartelTarget {
 
   final YOLOResult detection;
   final Rect normalizedRect;
+}
+
+class _CartelReading {
+  const _CartelReading({
+    required this.label,
+    required this.text,
+    this.imageBytes,
+  });
+
+  final String label;
+  final String text;
+  final Uint8List? imageBytes;
+
+  bool get hasText => text.trim().isNotEmpty;
+
+  bool isSameContent(_CartelReading other) {
+    return label.toLowerCase() == other.label.toLowerCase() &&
+        text.trim() == other.text.trim();
+  }
 }
