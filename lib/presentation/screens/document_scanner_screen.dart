@@ -1,8 +1,9 @@
 import 'dart:async';
 import 'dart:typed_data';
-import 'dart:ui'; // ✅ requerido para WriteBuffer
+import 'dart:ui';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:google_mlkit_commons/google_mlkit_commons.dart';
@@ -42,6 +43,71 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
     super.initState();
     _configureTts();
     _initCamera();
+  }
+
+  Widget _buildCameraPreview() {
+    if (_cameraError != null) {
+      return _CameraStatusMessage(
+        icon: Icons.error_outline,
+        message: _cameraError!,
+      );
+    }
+
+    final controller = _cameraController;
+
+    if (!_isCameraInitialized || controller == null || !controller.value.isInitialized) {
+      return const _CameraStatusMessage(
+        icon: Icons.videocam_outlined,
+        message: 'Inicializando cámara...'
+            '\nAsegúrate de haber otorgado los permisos necesarios.',
+        showLoader: true,
+      );
+    }
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        CameraPreview(controller),
+        if (_isCapturingDocument || _isScanningDocument)
+          Container(
+            color: Colors.black38,
+            alignment: Alignment.center,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: const [
+                CircularProgressIndicator(),
+                SizedBox(height: 12),
+                Text(
+                  'Escaneando documento...'
+                  '\nMantén el dispositivo estable.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.white),
+                ),
+              ],
+            ),
+          ),
+        if (_isProcessingFrame && !_isCapturingDocument && !_isScanningDocument)
+          const Align(
+            alignment: Alignment.bottomCenter,
+            child: Padding(
+              padding: EdgeInsets.all(16),
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.all(Radius.circular(12)),
+                ),
+                child: Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  child: Text(
+                    'Buscando texto en tiempo real...',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
   }
 
   Future<void> _configureTts() async {
