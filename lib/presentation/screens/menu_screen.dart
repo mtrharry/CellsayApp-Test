@@ -43,7 +43,7 @@ class _MenuScreenState extends State<MenuScreen> {
 
   Future<void> _readMenu() async {
     await _speak(
-      'Menú principal. Opciones: Dinero, Objetos, Hora, Clima. Diga una opción.',
+      'Menú principal. Opciones: Dinero, Objetos, Documentos, Hora, Clima. Diga una opción.',
     );
   }
 
@@ -98,6 +98,17 @@ class _MenuScreenState extends State<MenuScreen> {
       Navigator.pushNamed(context, '/camera');
       return;
     }
+    if (t.contains('documento') ||
+        t.contains('texto') ||
+        t.contains('lector') ||
+        t.contains('lectura') ||
+        t.contains('leer')) {
+      await _stt.stop();
+      setState(() => _isListening = false);
+      if (!mounted) return;
+      Navigator.pushNamed(context, '/document-scanner');
+      return;
+    }
     if (t.contains('hora')) {
       await _stt.stop();
       setState(() => _isListening = false);
@@ -137,6 +148,11 @@ class _MenuScreenState extends State<MenuScreen> {
         label: 'Objetos',
         icon: Icons.center_focus_strong_rounded,
         onTap: () => Navigator.pushNamed(context, '/camera'),
+      ),
+      _BigButton(
+        label: 'Documentos',
+        icon: Icons.description_outlined,
+        onTap: () => Navigator.pushNamed(context, '/document-scanner'),
       ),
       _BigButton(
         label: 'Hora',

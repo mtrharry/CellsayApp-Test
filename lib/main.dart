@@ -5,6 +5,7 @@ import 'package:ultralytics_yolo_example/presentation/screens/camera_inference_s
 import 'package:ultralytics_yolo_example/presentation/screens/menu_screen.dart';
 import 'package:ultralytics_yolo_example/presentation/screens/money_detector_screen.dart';
 import 'package:ultralytics_yolo_example/presentation/screens/single_image_screen.dart';
+import 'package:ultralytics_yolo_example/presentation/screens/document_scanner_screen.dart';
 
 void main() {
   runApp(const MyApp());
@@ -34,6 +35,12 @@ class MyApp extends StatelessWidget {
         if (settings.name == '/single-image') {
           return MaterialPageRoute(
             builder: (_) => const SingleImageScreen(),
+            settings: settings,
+          );
+        }
+        if (settings.name == '/document-scanner') {
+          return MaterialPageRoute(
+            builder: (_) => const DocumentScannerScreen(),
             settings: settings,
           );
         }
