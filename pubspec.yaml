@@ -20,6 +20,7 @@ dependencies:
   image: ^4.1.7
   tflite_flutter: ^0.11.0
   permission_handler: ^11.3.1
+  google_mlkit_text_recognition: ^0.13.0
   ultralytics_yolo:
     git:
       url: https://github.com/ultralytics/yolo-flutter-app.git
