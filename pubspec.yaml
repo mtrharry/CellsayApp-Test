@@ -28,7 +28,6 @@ dependencies:
   cupertino_icons: ^1.0.8
   flutter_tts: ^3.8.0
   speech_to_text: ^7.0.0
-  google_mlkit_text_recognition: ^0.13.0
 
 dev_dependencies:
   integration_test:

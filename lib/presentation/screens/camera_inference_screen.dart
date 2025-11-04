@@ -17,17 +17,12 @@ import '../widgets/voice_settings_sheet.dart';
 /// - Camera controls (flip, zoom)
 /// - Performance metrics (FPS)
 class CameraInferenceScreen extends StatefulWidget {
-  // CORRECCIÓN CLAVE: Cambiar 'initialModel' por 'modelType'
   const CameraInferenceScreen({
     super.key,
     this.modelType = ModelType.Interior,
-    this.showDepthControls = false,
-    this.enableDepthProcessing = false,
   });
 
   final ModelType modelType;
-  final bool showDepthControls;
-  final bool enableDepthProcessing;
 
   @override
   State<CameraInferenceScreen> createState() => _CameraInferenceScreenState();
@@ -39,20 +34,12 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> {
   @override
   void initState() {
     super.initState();
-    // CORRECCIÓN: Usar widget.modelType
     _controller = CameraInferenceController(initialModel: widget.modelType);
     _controller.initialize().catchError((error) {
       if (mounted) {
         _showError('Model Loading Error', error.toString());
       }
     });
-    if (widget.enableDepthProcessing) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) {
-          _controller.setDepthProcessingEnabled(true);
-        }
-      });
-    }
   }
 
   @override
@@ -76,7 +63,6 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> {
               CameraInferenceOverlay(
                 controller: _controller,
                 isLandscape: isLandscape,
-                showDepthControls: widget.showDepthControls,
               ),
               CameraControls(
                 currentZoomLevel: _controller.currentZoomLevel,
@@ -121,18 +107,18 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> {
   }
 
   void _showError(String title, String message) => showDialog(
-    context: context,
-    builder: (context) => AlertDialog(
-      title: Text(title),
-      content: Text(message),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('OK'),
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text(title),
+          content: Text(message),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('OK'),
+            ),
+          ],
         ),
-      ],
-    ),
-  );
+      );
 
   void _showVoiceSettings() {
     showModalBottomSheet(
@@ -146,5 +132,4 @@ class _CameraInferenceScreenState extends State<CameraInferenceScreen> {
       ),
     );
   }
-
 }
