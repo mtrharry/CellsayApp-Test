@@ -1,6 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
-
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:ultralytics_yolo/models/yolo_result.dart';
@@ -14,7 +12,6 @@ import '../../models/detection_insight.dart';
 import '../../models/models.dart';
 import '../../models/voice_settings.dart';
 import '../../services/detection_post_processor.dart';
-import '../../services/depth_inference_service.dart';
 import '../../services/model_manager.dart';
 import '../../services/voice_announcer.dart';
 import '../../services/voice_command_service.dart';
@@ -69,9 +66,6 @@ class CameraInferenceController extends ChangeNotifier {
   DistanceEstimatorProvider();
   DistanceEstimator? _distanceEstimator;
   bool _loggedMissingDistanceEstimator = false;
-  DepthInferenceService? _depthService;
-  DepthFrame? _latestDepthFrame;
-  bool _isDepthProcessingEnabled = false;
 
   // Performance optimization
   bool _isDisposed = false;
@@ -114,8 +108,6 @@ class CameraInferenceController extends ChangeNotifier {
   String? get voiceCommandStatus => _voiceCommandStatus;
   bool get isListeningForCommand => _isListeningForCommand;
   YOLOViewController get yoloController => _yoloController;
-  bool get isDepthProcessingEnabled => _isDepthProcessingEnabled;
-  bool get isDepthServiceAvailable => _depthService != null;
 
   CameraInferenceController({ModelType initialModel = ModelType.Interior})
       : _selectedModel = initialModel,
@@ -135,7 +127,6 @@ class CameraInferenceController extends ChangeNotifier {
         Timer.periodic(const Duration(seconds: 1), (_) => _onStatusTick());
     unawaited(_refreshWeather());
     unawaited(_loadDistanceEstimator());
-    unawaited(_initializeDepthService());
     _yoloController.setThresholds(
       confidenceThreshold: _confidenceThreshold,
       iouThreshold: _iouThreshold,
@@ -295,27 +286,6 @@ class CameraInferenceController extends ChangeNotifier {
       }
     }
 
-    Uint8List? originalImage;
-    final imageData = data['originalImage'];
-    if (imageData is Uint8List) {
-      originalImage = imageData;
-    }
-
-    if (originalImage != null && results.isNotEmpty) {
-      if (_isDepthProcessingEnabled) {
-        final depthService = _depthService;
-        if (depthService != null) {
-          final depthFrame = await depthService.estimateDepth(originalImage);
-          if (_isDisposed) return;
-          _latestDepthFrame = depthFrame;
-        } else {
-          _latestDepthFrame = null;
-        }
-      } else {
-        _latestDepthFrame = null;
-      }
-    }
-
     if (_isDisposed) return;
     onDetectionResults(results);
   }
@@ -324,12 +294,10 @@ class CameraInferenceController extends ChangeNotifier {
     if (results.isEmpty) return;
 
     final estimator = _distanceEstimator;
-    final depthFrame = _latestDepthFrame;
-
-    if (estimator == null && depthFrame == null) {
+    if (estimator == null) {
       if (!_loggedMissingDistanceEstimator) {
         debugPrint(
-          'DistanceEstimator: estimador no disponible y sin mapa de profundidad, se omiten las distancias.',
+          'DistanceEstimator: estimador no disponible, se omiten las distancias.',
         );
         _loggedMissingDistanceEstimator = true;
       }
@@ -341,30 +309,10 @@ class CameraInferenceController extends ChangeNotifier {
 
     for (final result in results) {
       final label = extractLabel(result).toLowerCase();
-      double? depthDistance;
-      if (depthFrame != null) {
-        depthDistance = depthFrame.estimateDistance(result.normalizedBox);
-        if (depthDistance != null) {
-          debugPrint(
-            'DepthInference: clase=$label depthDistance=${depthDistance.toStringAsFixed(2)}m',
-          );
-        }
-      }
-
-      double? geometricDistance;
-      if (estimator != null) {
-        geometricDistance = _estimateGeometricDistance(result, estimator, label);
-      }
-
-      result.distanceM = _combineDistanceEstimates(depthDistance, geometricDistance);
+      final geometricDistance =
+          _estimateGeometricDistance(result, estimator, label);
+      result.distanceM = geometricDistance;
     }
-  }
-
-  double? _combineDistanceEstimates(double? depth, double? geometric) {
-    if (depth != null && geometric != null) {
-      return (depth * 0.7) + (geometric * 0.3);
-    }
-    return depth ?? geometric;
   }
 
   double? _estimateGeometricDistance(
@@ -1102,33 +1050,6 @@ class CameraInferenceController extends ChangeNotifier {
     }
   }
 
-  Future<void> _initializeDepthService() async {
-    try {
-      final service = DepthInferenceService(sampleStep: 3);
-      await service.initialize();
-      if (_isDisposed) {
-        await service.dispose();
-        return;
-      }
-      _depthService = service;
-      notifyListeners();
-    } catch (error, stackTrace) {
-      if (_isDisposed) return;
-      debugPrint('DepthInferenceService: error al inicializar - $error');
-      debugPrint('$stackTrace');
-      notifyListeners();
-    }
-  }
-
-  void setDepthProcessingEnabled(bool enabled) {
-    if (_isDepthProcessingEnabled == enabled) return;
-    _isDepthProcessingEnabled = enabled;
-    if (!enabled) {
-      _latestDepthFrame = null;
-    }
-    notifyListeners();
-  }
-
   Future<void> _announceSystemMessage(
       String message, {
         bool force = false,
@@ -1156,9 +1077,6 @@ class CameraInferenceController extends ChangeNotifier {
     _statusTimer?.cancel();
     unawaited(_voiceCommandService.dispose());
     _weatherService.dispose();
-    unawaited(_depthService?.dispose());
-    _depthService = null;
-    _latestDepthFrame = null;
     super.dispose();
   }
 }

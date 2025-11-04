@@ -3,8 +3,6 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
-import 'package:ultralytics_yolo_example/models/camera_launch_args.dart';
-import 'package:ultralytics_yolo_example/models/models.dart';
 import 'package:ultralytics_yolo_example/services/weather_service.dart';
 
 class MenuScreen extends StatefulWidget {
@@ -45,7 +43,7 @@ class _MenuScreenState extends State<MenuScreen> {
 
   Future<void> _readMenu() async {
     await _speak(
-      'Menú principal. Opciones: Dinero, Objetos, Profundidad, Lectura, Hora, Clima. Diga una opción.',
+      'Menú principal. Opciones: Dinero, Objetos, Hora, Clima. Diga una opción.',
     );
   }
 
@@ -100,20 +98,6 @@ class _MenuScreenState extends State<MenuScreen> {
       Navigator.pushNamed(context, '/camera');
       return;
     }
-    if (t.contains('profund')) {
-      await _stt.stop();
-      setState(() => _isListening = false);
-      if (!mounted) return;
-      Navigator.pushNamed(context, '/depth');
-      return;
-    }
-    if (t.contains('lectura') || t.contains('texto') || t.contains('leer')) {
-      await _stt.stop();
-      setState(() => _isListening = false);
-      if (!mounted) return;
-      Navigator.pushNamed(context, '/text-reader');
-      return;
-    }
     if (t.contains('hora')) {
       await _stt.stop();
       setState(() => _isListening = false);
@@ -144,7 +128,6 @@ class _MenuScreenState extends State<MenuScreen> {
   @override
   Widget build(BuildContext context) {
     final buttons = <_BigButton>[
-      // 1. Botón para el modo de voz (el que tenías antes)
       _BigButton(
         label: 'Dinero',
         icon: Icons.attach_money_rounded,
@@ -154,16 +137,6 @@ class _MenuScreenState extends State<MenuScreen> {
         label: 'Objetos',
         icon: Icons.center_focus_strong_rounded,
         onTap: () => Navigator.pushNamed(context, '/camera'),
-      ),
-      _BigButton(
-        label: 'Profundidad',
-        icon: Icons.straighten,
-        onTap: () => Navigator.pushNamed(context, '/depth'),
-      ),
-      _BigButton(
-        label: 'Lectura',
-        icon: Icons.menu_book_rounded,
-        onTap: () => Navigator.pushNamed(context, '/text-reader'),
       ),
       _BigButton(
         label: 'Hora',
