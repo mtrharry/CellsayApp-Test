@@ -25,6 +25,7 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
   DocumentScanResult? _result;
   bool _isProcessing = false;
   bool _isSpeaking = false;
+  bool _cancelSpeaking = false;
 
   @override
   void initState() {
@@ -61,7 +62,7 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
       });
 
       if (result.hasText) {
-        await _speak(result.text);
+        await _readDetectedText(result, withAnnouncement: true);
       } else {
         _showMessage('No se detectó texto legible en el documento.');
       }
@@ -72,13 +73,66 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
     }
   }
 
-  Future<void> _speak(String text) async {
-    if (text.trim().isEmpty) return;
+  Future<void> _readDetectedText(
+    DocumentScanResult result, {
+    bool withAnnouncement = false,
+  }) async {
+    final phrases = result.phrases;
+    if (phrases.isEmpty) {
+      return;
+    }
+
     await _tts.stop();
-    setState(() => _isSpeaking = true);
-    await _tts.speak(text);
+    _cancelSpeaking = false;
     if (!mounted) return;
-    setState(() => _isSpeaking = false);
+    setState(() => _isSpeaking = true);
+
+    try {
+      if (withAnnouncement) {
+        await _speakSegment('He detectado texto tomando captura.');
+        if (_cancelSpeaking) return;
+        await _waitWithCancellation(const Duration(seconds: 2));
+        if (_cancelSpeaking) return;
+      }
+
+      for (final phrase in phrases) {
+        await _speakSegment(phrase);
+        if (_cancelSpeaking) {
+          return;
+        }
+      }
+    } finally {
+      if (!mounted) return;
+      setState(() => _isSpeaking = false);
+    }
+  }
+
+  Future<void> _speakSegment(String text) async {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty || _cancelSpeaking) {
+      return;
+    }
+
+    try {
+      await _tts.speak(trimmed);
+    } catch (_) {
+      // Ignore speech errors to avoid interrupting the flow.
+    }
+  }
+
+  Future<void> _waitWithCancellation(Duration duration) async {
+    const step = Duration(milliseconds: 100);
+    var elapsed = Duration.zero;
+
+    while (!_cancelSpeaking && elapsed < duration) {
+      final remaining = duration - elapsed;
+      final wait = remaining < step ? remaining : step;
+      if (wait <= Duration.zero) {
+        break;
+      }
+      await Future.delayed(wait);
+      elapsed += wait;
+    }
   }
 
   void _showMessage(String message) {
@@ -87,6 +141,7 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
   }
 
   Future<void> _stopSpeaking() async {
+    _cancelSpeaking = true;
     await _tts.stop();
     if (!mounted) return;
     setState(() => _isSpeaking = false);
@@ -122,7 +177,7 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
                     ? _ResultView(
                         imagePath: file.path,
                         result: result,
-                        onReadAgain: () => _speak(result.text),
+                        onReadAgain: () => _readDetectedText(result),
                         isSpeaking: _isSpeaking,
                         onStopSpeaking: _stopSpeaking,
                       )
@@ -208,6 +263,9 @@ class _ResultView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
+    final phrases = result.phrases;
+    final hasText = result.hasText;
+
     return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -225,26 +283,51 @@ class _ResultView extends StatelessWidget {
               ),
               const Spacer(),
               IconButton(
-                onPressed: isSpeaking ? onStopSpeaking : onReadAgain,
+                onPressed:
+                    hasText ? (isSpeaking ? onStopSpeaking : onReadAgain) : null,
                 tooltip: isSpeaking ? 'Detener lectura' : 'Escuchar texto',
                 icon: Icon(isSpeaking ? Icons.stop_circle : Icons.volume_up),
               ),
             ],
           ),
           const SizedBox(height: 8),
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: Theme.of(context).colorScheme.surfaceContainerHighest,
-              borderRadius: BorderRadius.circular(12),
+          if (hasText)
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                for (var i = 0; i < phrases.length; i++) ...[
+                  Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Theme.of(context)
+                          .colorScheme
+                          .surfaceContainerHighest,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: Theme.of(context).colorScheme.outlineVariant,
+                      ),
+                    ),
+                    child: Text(
+                      phrases[i],
+                      style: textTheme.bodyLarge,
+                    ),
+                  ),
+                  if (i != phrases.length - 1) const SizedBox(height: 12),
+                ],
+              ],
+            )
+          else
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Text(
+                'No se detectó texto en el documento.',
+                style: textTheme.bodyLarge,
+              ),
             ),
-            child: Text(
-              result.hasText
-                  ? result.text
-                  : 'No se detectó texto en el documento.',
-              style: textTheme.bodyLarge,
-            ),
-          ),
         ],
       ),
     );

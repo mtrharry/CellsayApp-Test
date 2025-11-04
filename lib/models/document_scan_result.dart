@@ -16,6 +16,29 @@ class DocumentScanResult {
 
   /// Whether the scan contains any readable text.
   bool get hasText => text.trim().isNotEmpty;
+
+  /// Phrases extracted from each recognized block, split by line breaks.
+  List<String> get phrases {
+    final segments = blocks
+        .expand(
+          (block) => block.text
+              .split(RegExp(r'[\r\n]+'))
+              .map((segment) => segment.trim()),
+        )
+        .where((segment) => segment.isNotEmpty)
+        .toList(growable: false);
+
+    if (segments.isNotEmpty) {
+      return List.unmodifiable(segments);
+    }
+
+    final fallback = text.trim();
+    if (fallback.isEmpty) {
+      return const [];
+    }
+
+    return List.unmodifiable(<String>[fallback]);
+  }
 }
 
 /// Represents a single recognized text block within a document.
