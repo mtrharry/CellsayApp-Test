@@ -17,8 +17,23 @@ class DocumentScannerService {
   /// as a [DocumentScanResult].
   Future<DocumentScanResult> scan(String imagePath) async {
     final inputImage = InputImage.fromFilePath(imagePath);
+    return scanFromInputImage(inputImage);
+  }
+
+  /// Processes a live [InputImage] (e.g. from the camera stream) and returns
+  /// the recognized text as a [DocumentScanResult].
+  Future<DocumentScanResult> scanFromInputImage(InputImage inputImage) async {
     final recognizedText = await _textRecognizer.processImage(inputImage);
 
+    return _mapRecognizedText(recognizedText);
+  }
+
+  /// Releases ML Kit resources when the service is no longer needed.
+  Future<void> dispose() async {
+    await _textRecognizer.close();
+  }
+
+  DocumentScanResult _mapRecognizedText(RecognizedText recognizedText) {
     final blocks = recognizedText.blocks
         .map(
           (block) => DocumentTextBlock(
@@ -32,10 +47,5 @@ class DocumentScannerService {
       text: recognizedText.text.trim(),
       blocks: blocks,
     );
-  }
-
-  /// Releases ML Kit resources when the service is no longer needed.
-  Future<void> dispose() async {
-    await _textRecognizer.close();
   }
 }
