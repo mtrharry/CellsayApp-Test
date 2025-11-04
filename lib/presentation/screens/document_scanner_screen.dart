@@ -1,10 +1,11 @@
 import 'dart:async';
 import 'dart:typed_data';
-import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:google_mlkit_commons/google_mlkit_commons.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -170,7 +171,7 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
   }
 
   InputImage _buildInputImage(CameraImage image, CameraController controller) {
-    final ui.WriteBuffer allBytes = ui.WriteBuffer();
+    final WriteBuffer allBytes = WriteBuffer();
     for (final plane in image.planes) {
       allBytes.putUint8List(plane.bytes);
     }
