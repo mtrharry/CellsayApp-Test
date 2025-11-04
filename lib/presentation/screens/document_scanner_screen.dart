@@ -34,6 +34,7 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
 
   bool _isScanningDocument = false;
   bool _isProcessingFrame = false;
+  DateTime? _lastFrameProcessedAt;
   bool _isCapturingDocument = false;
   bool _isSpeaking = false;
   bool _cancelSpeaking = false;
@@ -192,7 +193,14 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
     if (_isProcessingFrame || _isCapturingDocument || _isScanningDocument) return;
     if (_result != null) return;
 
+    final now = DateTime.now();
+    if (_lastFrameProcessedAt != null &&
+        now.difference(_lastFrameProcessedAt!) < const Duration(milliseconds: 400)) {
+      return;
+    }
+
     _isProcessingFrame = true;
+    _lastFrameProcessedAt = now;
 
     try {
       final controller = _cameraController;
@@ -204,8 +212,9 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
       if (detection.hasText) {
         await _handleDetectedText();
       }
-    } catch (_) {}
-    finally {
+    } catch (error, stackTrace) {
+      debugPrint('Document scan failed: $error\n$stackTrace');
+    } finally {
       _isProcessingFrame = false;
     }
   }
@@ -219,6 +228,16 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
 
     final bytes = allBytes.done().buffer.asUint8List();
 
+    final planeData = image.planes
+        .map(
+          (plane) => InputImagePlaneMetadata(
+            bytesPerRow: plane.bytesPerRow,
+            height: plane.height,
+            width: plane.width,
+          ),
+        )
+        .toList();
+
     return InputImage.fromBytes(
       bytes: bytes,
       metadata: InputImageMetadata(
@@ -227,7 +246,8 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
           controller.description.sensorOrientation,
         ) ?? InputImageRotation.rotation0deg,
         format: InputImageFormatValue.fromRawValue(image.format.raw)
-            ?? InputImageFormat.nv21,
+            ?? InputImageFormat.yuv420,
+        planeData: planeData,
         bytesPerRow: image.planes.first.bytesPerRow,
       ),
     );
