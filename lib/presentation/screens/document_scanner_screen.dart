@@ -1,8 +1,13 @@
 import 'dart:async';
+import 'dart:typed_data';
 
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
-import 'package:image_picker/image_picker.dart';
+import 'package:google_mlkit_commons/google_mlkit_commons.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../../models/document_scan_result.dart';
 import '../../services/document_scanner_service.dart';
@@ -17,13 +22,19 @@ class DocumentScannerScreen extends StatefulWidget {
 }
 
 class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
-  final _picker = ImagePicker();
   final _scannerService = DocumentScannerService();
   final _tts = FlutterTts();
 
+  CameraController? _cameraController;
+  bool _isCameraInitialized = false;
+  String? _cameraError;
+
   XFile? _capturedFile;
   DocumentScanResult? _result;
-  bool _isProcessing = false;
+
+  bool _isScanningDocument = false;
+  bool _isProcessingFrame = false;
+  bool _isCapturingDocument = false;
   bool _isSpeaking = false;
   bool _cancelSpeaking = false;
 
@@ -31,6 +42,7 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
   void initState() {
     super.initState();
     _configureTts();
+    _initCamera();
   }
 
   Future<void> _configureTts() async {
@@ -40,37 +52,287 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
     await _tts.awaitSpeakCompletion(true);
   }
 
-  Future<void> _scanDocument() async {
+  Future<void> _initCamera() async {
+    CameraController? controller;
     try {
-      final file = await _picker.pickImage(source: ImageSource.camera);
-      if (file == null) {
+      final status = await Permission.camera.request();
+      if (!status.isGranted) {
+        if (!mounted) return;
+        setState(() {
+          _cameraError =
+              'Se requiere el permiso de cámara para escanear documentos.';
+        });
+        return;
+      }
+
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _cameraError = 'No se encontró ninguna cámara disponible.';
+        });
+        return;
+      }
+
+      controller = CameraController(
+        cameras.first,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420,
+      );
+
+      await controller.initialize();
+      await controller.setFlashMode(FlashMode.off);
+
+      if (!mounted) {
+        await controller.dispose();
         return;
       }
 
       setState(() {
-        _isProcessing = true;
-        _capturedFile = file;
-        _result = null;
+        _cameraController = controller;
+        _isCameraInitialized = true;
+        _cameraError = null;
       });
 
-      final result = await _scannerService.scan(file.path);
-
+      await _startImageStream();
+    } catch (_) {
+      await controller?.dispose();
       if (!mounted) return;
       setState(() {
-        _isProcessing = false;
-        _result = result;
+        _cameraError = 'No se pudo inicializar la cámara.';
+      });
+    }
+  }
+
+  Future<void> _startImageStream() async {
+    final controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+    if (controller.value.isStreamingImages) {
+      return;
+    }
+    try {
+      await controller.startImageStream(_onCameraImage);
+      if (!mounted) return;
+      setState(() {
+        _cameraError = null;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _cameraError = 'No se pudo iniciar la transmisión de la cámara.';
+      });
+    }
+  }
+
+  Future<void> _stopImageStream() async {
+    final controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+    if (!controller.value.isStreamingImages) {
+      return;
+    }
+    try {
+      await controller.stopImageStream();
+    } catch (_) {
+      // Ignorar errores al detener la transmisión para evitar bloquear el flujo.
+    }
+  }
+
+  Future<void> _onCameraImage(CameraImage image) async {
+    if (_isProcessingFrame || _isCapturingDocument || _isScanningDocument) {
+      return;
+    }
+    if (_result != null) {
+      return;
+    }
+
+    _isProcessingFrame = true;
+    try {
+      final controller = _cameraController;
+      if (controller == null) {
+        return;
+      }
+
+      final inputImage = _buildInputImage(image, controller);
+      final detection = await _scannerService.scanFromInputImage(inputImage);
+
+      if (detection.hasText) {
+        await _handleDetectedText();
+      }
+    } catch (_) {
+      // Ignorar errores de detección en tiempo real.
+    } finally {
+      _isProcessingFrame = false;
+    }
+  }
+
+  InputImage _buildInputImage(CameraImage image, CameraController controller) {
+    final WriteBuffer allBytes = WriteBuffer();
+    for (final plane in image.planes) {
+      allBytes.putUint8List(plane.bytes);
+    }
+    final Uint8List bytes = allBytes.done().buffer.asUint8List();
+
+    final imageSize = Size(image.width.toDouble(), image.height.toDouble());
+    final rotation = InputImageRotationValue.fromRawValue(
+          controller.description.sensorOrientation,
+        ) ??
+        InputImageRotation.rotation0deg;
+    final format = InputImageFormatValue.fromRawValue(image.format.raw) ??
+        InputImageFormat.nv21;
+
+    final planeData = image.planes
+        .map(
+          (plane) => InputImagePlaneMetadata(
+            bytesPerRow: plane.bytesPerRow,
+            height: plane.height,
+            width: plane.width,
+          ),
+        )
+        .toList(growable: false);
+
+    return InputImage.fromBytes(
+      bytes: bytes,
+      inputImageData: InputImageData(
+        size: imageSize,
+        imageRotation: rotation,
+        inputImageFormat: format,
+        planeData: planeData,
+      ),
+    );
+  }
+
+  Future<void> _handleDetectedText() async {
+    if (_isCapturingDocument) {
+      return;
+    }
+
+    final controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+
+    _isCapturingDocument = true;
+    try {
+      await _stopImageStream();
+
+      await _tts.stop();
+      _cancelSpeaking = false;
+      await _speakSegment(
+        'He detectado texto frente a la cámara. Procediendo a escanear.',
+      );
+
+      final file = await controller.takePicture();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _capturedFile = file;
+        _result = null;
+        _isScanningDocument = true;
       });
 
-      if (result.hasText) {
-        await _readDetectedText(result, withAnnouncement: true);
+      final scanResult = await _scannerService.scan(file.path);
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _result = scanResult;
+        _isScanningDocument = false;
+      });
+
+      if (scanResult.hasText) {
+        await _readDetectedText(scanResult);
       } else {
         _showMessage('No se detectó texto legible en el documento.');
       }
     } catch (_) {
-      if (!mounted) return;
-      setState(() => _isProcessing = false);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _isScanningDocument = false;
+      });
       _showMessage('No se pudo escanear el documento. Inténtalo de nuevo.');
+      await _restartScanning();
+    } finally {
+      _isCapturingDocument = false;
     }
+  }
+
+  Future<void> _restartScanning() async {
+    await _stopSpeaking();
+
+    final controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _capturedFile = null;
+      _result = null;
+      _isScanningDocument = false;
+    });
+
+    _cancelSpeaking = false;
+    await _startImageStream();
+  }
+
+  Widget _buildCameraPreview() {
+    final error = _cameraError;
+    if (error != null) {
+      return _CameraStatusMessage(
+        icon: Icons.error_outline,
+        message: error,
+      );
+    }
+
+    final controller = _cameraController;
+    if (controller == null || !_isCameraInitialized) {
+      return const _CameraStatusMessage(
+        icon: Icons.photo_camera_outlined,
+        message: 'Inicializando cámara...',
+        showLoader: true,
+      );
+    }
+
+    final statusText = _isScanningDocument
+        ? 'Escaneando documento...'
+        : 'Buscando texto en el documento';
+
+    final statusIcon =
+        _isScanningDocument ? Icons.hourglass_bottom : Icons.search_rounded;
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(16),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          CameraPreview(controller),
+          Positioned(
+            left: 16,
+            right: 16,
+            bottom: 16,
+            child: _ScannerStatusBubble(
+              icon: statusIcon,
+              text: statusText,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _readDetectedText(
@@ -149,6 +411,11 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
 
   @override
   void dispose() {
+    final controller = _cameraController;
+    if (controller != null) {
+      unawaited(_stopImageStream());
+      unawaited(controller.dispose());
+    }
     unawaited(_tts.stop());
     unawaited(_scannerService.dispose());
     super.dispose();
@@ -170,7 +437,7 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              if (_isProcessing) const LinearProgressIndicator(),
+              if (_isScanningDocument) const LinearProgressIndicator(),
               const SizedBox(height: 16),
               Expanded(
                 child: hasResult
@@ -181,21 +448,22 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
                         isSpeaking: _isSpeaking,
                         onStopSpeaking: _stopSpeaking,
                       )
-                    : _EmptyState(onScanPressed: _scanDocument),
+                    : _buildCameraPreview(),
               ),
               const SizedBox(height: 16),
               if (hasResult) ...[
                 FilledButton.icon(
-                  onPressed: _scanDocument,
-                  icon: const Icon(Icons.document_scanner_outlined),
-                  label: const Text('Leer otro documento'),
+                  onPressed: _restartScanning,
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Escanear otro documento'),
                 ),
                 const SizedBox(height: 12),
-              ] else ...[
-                FilledButton.icon(
-                  onPressed: _scanDocument,
-                  icon: const Icon(Icons.document_scanner_outlined),
-                  label: const Text('Escanear documento'),
+              ] else if (_cameraError == null) ...[
+                Text(
+                  'Apunta la cámara hacia un documento con texto. '
+                  'El escaneo comenzará automáticamente cuando se detecte contenido legible.',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodyMedium,
                 ),
                 const SizedBox(height: 12),
               ],
@@ -212,34 +480,82 @@ class _DocumentScannerScreenState extends State<DocumentScannerScreen> {
   }
 }
 
-class _EmptyState extends StatelessWidget {
-  const _EmptyState({required this.onScanPressed});
+class _CameraStatusMessage extends StatelessWidget {
+  const _CameraStatusMessage({
+    required this.icon,
+    required this.message,
+    this.showLoader = false,
+  });
 
-  final VoidCallback onScanPressed;
+  final IconData icon;
+  final String message;
+  final bool showLoader;
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
+        mainAxisSize: MainAxisSize.min,
         children: [
           Icon(
-            Icons.document_scanner_outlined,
+            icon,
             size: 72,
-            color: Theme.of(context).colorScheme.primary,
+            color: theme.colorScheme.primary,
           ),
           const SizedBox(height: 16),
-          const Text(
-            'Escanea un documento para extraer el texto. '
-            'El documento se detectará automáticamente y podrás escucharlo.',
+          Text(
+            message,
+            style: theme.textTheme.bodyLarge,
             textAlign: TextAlign.center,
           ),
-          const SizedBox(height: 24),
-          FilledButton(
-            onPressed: onScanPressed,
-            child: const Text('Comenzar escaneo'),
-          ),
+          if (showLoader) ...[
+            const SizedBox(height: 16),
+            const CircularProgressIndicator(),
+          ],
         ],
+      ),
+    );
+  }
+}
+
+class _ScannerStatusBubble extends StatelessWidget {
+  const _ScannerStatusBubble({
+    required this.icon,
+    required this.text,
+  });
+
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final textStyle = Theme.of(context).textTheme.bodyMedium;
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: colorScheme.surface.withOpacity(0.85),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: colorScheme.outlineVariant),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: colorScheme.primary),
+            const SizedBox(width: 8),
+            Flexible(
+              child: Text(
+                text,
+                style: textStyle,
+                textAlign: TextAlign.center,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
